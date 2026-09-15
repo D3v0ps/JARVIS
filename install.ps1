@@ -178,7 +178,12 @@ function Invoke-Native {
     $ErrorActionPreference = "Continue"
     try {
         if ($Passthrough) {
-            & $File @Arguments
+            # Out-Host is not optional. Without it a native command's stdout lands in
+            # PowerShell's OUTPUT stream, so this function returns pip's entire
+            # transcript with the exit code tacked on the end - and `$code -ne 0`
+            # against that array is true even when the command succeeded. That is
+            # precisely how a clean `pip install` was reported as a failure.
+            & $File @Arguments | Out-Host
         } elseif ($Quiet) {
             & $File @Arguments 2>&1 | ForEach-Object { Write-Log "    $_" }
         } else {
@@ -191,7 +196,9 @@ function Invoke-Native {
     } finally {
         $ErrorActionPreference = $previousPreference
     }
+    if ($code -is [array]) { $code = $code[-1] }     # belt and braces
     if ($null -eq $code) { $code = 0 }
+    $code = [int]$code
     Write-Log "exit code $code"
     return $code
 }
