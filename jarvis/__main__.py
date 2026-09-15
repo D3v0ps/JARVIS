@@ -38,6 +38,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--say", metavar="TEXT", default=None, help="speak one line and exit")
     parser.add_argument("--list-devices", action="store_true", help="list audio devices and exit")
     parser.add_argument("--preflight", action="store_true", help="check this machine and exit")
+    parser.add_argument("--overlay-test", dest="overlay_test", action="store_true",
+                        help="show the overlay on its own for ten seconds and exit")
     parser.add_argument("--version", action="store_true", help="print the version and exit")
     # Accepted here so the installer can pass them through in one command line.
     parser.add_argument("--fix", action="store_true", help=argparse.SUPPRESS)
@@ -76,6 +78,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             forwarded.append("--json")
         return preflight_main(forwarded)
+
+    if args.overlay_test:
+        from jarvis.config import Config as _Config
+        from jarvis.core.logging import setup_logging as _setup
+
+        try:
+            cfg = _Config.load(args.config)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not read the configuration: {exc}", file=sys.stderr)
+            return 1
+        return _overlay_test(cfg, _setup(cfg))
 
     if args.list_devices:
         from jarvis.audio.devices import print_devices
@@ -119,6 +132,70 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         assistant.stop()
     return 0
+
+
+def _overlay_test(cfg, logger) -> int:
+    """Cycle the overlay through every state so you can see it in ten seconds.
+
+    Worth its own flag: the overlay is the one part that cannot be proven by a test,
+    only by looking at it.
+    """
+    import time
+
+    from jarvis.core.state import AssistantState, StateBus
+    from jarvis.core.wiring import build_face
+
+    state = StateBus()
+    overlay, tray = build_face(
+        cfg, state, on_quit=lambda: None, on_toggle_pause=lambda: None, logger=logger
+    )
+    if overlay is None:
+        print("  No overlay could be started on this machine. The log says why.")
+        return 1
+
+    backend = type(overlay).__name__
+    print(f"  {backend} is up. Cycling through the states - watch the corner of your screen.")
+
+    hud = getattr(overlay, "hud", None)
+    script = [
+        (AssistantState.IDLE, 2.0, None, None),
+        (AssistantState.LISTENING, 2.5, "what's the time and how's the system", None),
+        (AssistantState.THINKING, 2.5, None, "system_status"),
+        (AssistantState.SPEAKING, 3.0,
+         None, "It's just gone eleven, sir, and the system is barely awake at four percent."),
+        (AssistantState.IDLE, 1.5, None, None),
+    ]
+    try:
+        for assistant_state, seconds, heard, extra in script:
+            state.set(assistant_state)
+            if hud is not None:
+                if heard:
+                    hud.begin_turn(heard)
+                if assistant_state is AssistantState.THINKING and extra:
+                    hud.tool_started(extra)
+                if assistant_state is AssistantState.SPEAKING and extra:
+                    hud.tool_finished("system_status", ok=True, duration_ms=118)
+                    hud.add_reply(extra)
+                    hud.latency_ms = 1180
+            print(f"    {assistant_state.value}")
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                if hasattr(overlay, "set_amplitude") and assistant_state in (
+                    AssistantState.LISTENING, AssistantState.SPEAKING
+                ):
+                    overlay.set_amplitude(0.3 + 0.5 * abs(time.time() % 1 - 0.5))
+                time.sleep(0.05)
+        print("  Done. If that looked right, he is ready.")
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        for component in (overlay, tray):
+            if component is not None:
+                try:
+                    component.stop()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def _say_once(cfg, text: str, logger) -> int:

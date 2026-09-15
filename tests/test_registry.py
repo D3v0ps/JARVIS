@@ -30,6 +30,13 @@ def clean_registry():
     saved_loaded = set(registry._loaded_modules)
     saved_failed = dict(registry._failed_modules)
     saved_modules = set(sys.modules)
+    # Start from a blank registry. Without this, a test that registers a probe tool
+    # under a real tool's name (lock_pc, weather, ...) collides with whatever another
+    # test file happened to load first, and the failure looks like a registry bug
+    # rather than what it is - test pollution.
+    registry.REGISTRY.clear()
+    registry._loaded_modules.clear()
+    registry._failed_modules.clear()
     try:
         yield
     finally:

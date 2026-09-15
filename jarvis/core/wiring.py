@@ -1,0 +1,289 @@
+"""Building JARVIS: every component, constructed once, in the right order.
+
+Kept apart from the loop in :mod:`jarvis.core.assistant` so that neither file
+becomes the kind of module nobody wants to open. The rule here is that a missing
+piece is never fatal: no microphone, no GPU, no voice, no Ollama - each of those
+degrades to something that still runs and says so, because an assistant that
+refuses to start tells you nothing about what is wrong.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from jarvis.audio.player import Player
+from jarvis.brain.conversation import Conversation
+from jarvis.brain.ollama_client import OllamaClient
+from jarvis.config import Config, resolve_language
+from jarvis.core.latency import LatencyTracker
+from jarvis.core.logging import get_logger
+from jarvis.core.memory import Memory
+from jarvis.core.scheduler import Scheduler
+from jarvis.core.state import StateBus
+
+__all__ = ["Components", "build", "build_face"]
+
+
+@dataclass
+class Components:
+    """Everything the loop needs, already wired together."""
+
+    cfg: Config
+    log: logging.Logger
+    state: StateBus
+    memory: Memory
+    latency: LatencyTracker
+    scheduler: Scheduler
+    player: Player
+    speaker: Any
+    mic: Any
+    wake: Any
+    segmenter: Any
+    transcriber: Any
+    client: OllamaClient
+    conversation: Conversation
+    dispatcher: Any
+    brain: Any
+    language: str | None = None
+    problems: list[str] = field(default_factory=list)
+
+    def note(self, message: str) -> None:
+        """Record something the user should be told about, once."""
+        if message not in self.problems:
+            self.problems.append(message)
+            self.log.warning(message)
+
+
+def build(
+    cfg: Config,
+    *,
+    on_due: Callable[[Any], None],
+    speak: Callable[[str], None],
+    confirm: Callable[[str], bool],
+    notify: Callable[[str], None],
+    text_mode: bool = False,
+    logger: logging.Logger | None = None,
+) -> Components:
+    """Construct every part of the assistant. Never raises for a missing component."""
+    log = logger or get_logger("assistant")
+    state = StateBus()
+    latency = LatencyTracker(log)
+    language = resolve_language(cfg)
+
+    memory = Memory(cfg.resolve_path("memory.json") if cfg.get("memory_path") else "memory.json")
+    memory.load()
+
+    scheduler = Scheduler(on_due=on_due)
+
+    # --- voice out -------------------------------------------------------------------
+    player = Player(
+        cfg.get("audio.output_device"),
+        logger=get_logger("audio.player"),
+        volume=float(cfg.get("audio.output_volume", 1.0) or 1.0),
+    )
+    from jarvis.tts.engine import create_engine
+
+    engine = create_engine(cfg, get_logger("tts"))
+    from jarvis.tts.speaker import Speaker
+
+    speaker = Speaker(engine, player, state, language=language,
+                      logger=get_logger("tts.speaker"), latency=latency)
+
+    components_problems: list[str] = []
+    if getattr(engine, "name", "") == "null":
+        components_problems.append("No speech engine could be loaded; JARVIS will be silent.")
+
+    # --- ears ------------------------------------------------------------------------
+    mic = _build_mic(cfg, log, text_mode, components_problems)
+    wake = _build_wake(cfg, log, text_mode, components_problems)
+    segmenter = _build_segmenter(cfg, log)
+    transcriber = _build_transcriber(cfg, log)
+
+    # --- brain -----------------------------------------------------------------------
+    client = OllamaClient(
+        str(cfg.get("brain.host", "http://127.0.0.1:11434")),
+        str(cfg.get("brain.model", "qwen3:8b")),
+        keep_alive=cfg.get("brain.keep_alive", -1),
+        think=bool(cfg.get("brain.think", False)),
+        num_ctx=int(cfg.get("brain.num_ctx", 8192)),
+        temperature=float(cfg.get("brain.temperature", 0.6)),
+        timeout=int(cfg.get("brain.request_timeout", 120)),
+        logger=get_logger("brain.client"),
+    )
+    conversation = Conversation(
+        cfg.resolve_path("prompts/jarvis_system.md"),
+        memory,
+        history_turns=int(cfg.get("brain.history_turns", 12)),
+        language=language,
+        logger=get_logger("brain.conversation"),
+    )
+
+    # --- hands -----------------------------------------------------------------------
+    from jarvis.tools import registry
+    from jarvis.tools.base import ToolContext
+    from jarvis.tools.dispatcher import Dispatcher
+
+    registry.load_all()
+    ctx = ToolContext(
+        config=cfg, memory=memory, logger=get_logger("tools"),
+        speak=speak, confirm=confirm, notify=notify,
+        scheduler=scheduler, state=state,
+    )
+    dispatcher = Dispatcher(ctx, logger=get_logger("tools.dispatcher"))
+
+    try:  # deep_think needs a client of its own; wiring is the only place that has one
+        from jarvis.tools.think_tools import set_deep_client
+
+        set_deep_client(client)
+    except Exception as exc:  # noqa: BLE001 - an optional tool must not break startup
+        log.debug("deep_think is unavailable: %s", exc)
+
+    from jarvis.brain.brain import Brain
+
+    brain = Brain(
+        client, conversation, dispatcher,
+        max_tool_rounds=int(cfg.get("assistant.max_tool_rounds", 4)),
+        logger=get_logger("brain"), latency=latency,
+    )
+
+    built = Components(
+        cfg=cfg, log=log, state=state, memory=memory, latency=latency, scheduler=scheduler,
+        player=player, speaker=speaker, mic=mic, wake=wake, segmenter=segmenter,
+        transcriber=transcriber, client=client, conversation=conversation,
+        dispatcher=dispatcher, brain=brain, language=language,
+    )
+    for problem in components_problems:
+        built.note(problem)
+    log.info(
+        "Wired: %d tool(s), voice=%s, wake=%s, vad=%s",
+        len(registry.all_specs()), getattr(engine, "name", "?"),
+        "on" if getattr(wake, "available", False) else "off",
+        "silero" if getattr(segmenter, "available", False) else "energy",
+    )
+    return built
+
+
+# --- individual pieces ----------------------------------------------------------------
+def _build_mic(cfg: Config, log: logging.Logger, text_mode: bool, problems: list[str]) -> Any:
+    from jarvis.audio.capture import MicStream, NullMicStream
+
+    if text_mode:
+        return NullMicStream()
+    try:
+        return MicStream(
+            device=cfg.get("audio.input_device"),
+            sample_rate=int(cfg.get("audio.sample_rate", 16000)),
+            block_size=int(cfg.get("audio.block_size", 1280)),
+            logger=get_logger("audio.capture"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"The microphone could not be opened ({exc}); voice input is off.")
+        log.warning("Falling back to a silent microphone: %s", exc)
+        return NullMicStream()
+
+
+def _build_wake(cfg: Config, log: logging.Logger, text_mode: bool, problems: list[str]) -> Any:
+    from jarvis.wake.detector import WakeWord
+
+    if text_mode or not cfg.get("wake.enabled", True):
+        return None
+    detector = WakeWord(
+        model=str(cfg.get("wake.model", "hey_jarvis")),
+        sensitivity=float(cfg.get("wake.sensitivity", 0.5)),
+        framework=str(cfg.get("wake.framework", "onnx")),
+        cooldown=float(cfg.get("wake.cooldown", 2.0)),
+        logger=get_logger("wake"),
+    )
+    if not detector.available:
+        problems.append(
+            "The wake word model is not available; say nothing and he will not wake. "
+            "Run scripts/fetch_models.py."
+        )
+    return detector
+
+
+def _build_segmenter(cfg: Config, log: logging.Logger) -> Any:
+    from jarvis.stt.vad import EnergySegmenter, SpeechSegmenter
+
+    kwargs = dict(
+        threshold=float(cfg.get("vad.threshold", 0.5)),
+        silence_ms=int(cfg.get("vad.silence_ms", 700)),
+        min_speech_ms=int(cfg.get("vad.min_speech_ms", 250)),
+        max_utterance_s=float(cfg.get("vad.max_utterance_s", 15)),
+        pre_roll_ms=int(cfg.get("vad.pre_roll_ms", 300)),
+        sample_rate=int(cfg.get("audio.sample_rate", 16000)),
+        logger=get_logger("stt.vad"),
+    )
+    silero = SpeechSegmenter(**kwargs)
+    if silero.available:
+        return silero
+    log.info("Silero VAD is unavailable; using the energy segmenter instead.")
+    return EnergySegmenter(**kwargs)
+
+
+def _build_transcriber(cfg: Config, log: logging.Logger) -> Any:
+    from jarvis.stt.transcriber import Transcriber
+
+    return Transcriber(
+        model=str(cfg.get("stt.model", "auto")),
+        device=str(cfg.get("stt.device", "auto")),
+        compute_type=str(cfg.get("stt.compute_type", "auto")),
+        beam_size=int(cfg.get("stt.beam_size", 1)),
+        language=resolve_language(cfg),
+        vram_gb=cfg.get("system.vram_gb"),
+        logger=get_logger("stt"),
+    )
+
+
+def build_face(
+    cfg: Config,
+    state: StateBus,
+    *,
+    on_quit: Callable[[], None],
+    on_toggle_pause: Callable[[], None],
+    logger: logging.Logger,
+) -> tuple[Any, Any]:
+    """Return ``(overlay, tray)``, either of which may be None.
+
+    The layered overlay is tried first because it is the one that looks right; the
+    tkinter ring is the fallback for anything that is not Windows.
+    """
+    overlay = None
+    if cfg.get("ui.overlay", True):
+        try:
+            from jarvis.ui.layered import LayeredOverlay
+
+            candidate = LayeredOverlay(
+                cfg, state, on_quit=on_quit, on_toggle_pause=on_toggle_pause, logger=logger
+            )
+            overlay = candidate if candidate.start() else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("The layered overlay could not start: %s", exc)
+        if overlay is None:
+            try:
+                from jarvis.ui.overlay import Overlay
+
+                overlay = Overlay(
+                    cfg, state, on_quit=on_quit, on_toggle_pause=on_toggle_pause, logger=logger
+                )
+                overlay.start()
+                if not overlay.is_alive():
+                    overlay = None
+            except Exception as exc:  # noqa: BLE001
+                logger.info("No overlay this session: %s", exc)
+                overlay = None
+
+    tray = None
+    if cfg.get("ui.tray", True):
+        try:
+            from jarvis.ui.tray import Tray
+
+            tray = Tray(state, on_quit=on_quit, on_toggle_pause=on_toggle_pause, logger=logger)
+            tray.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("No tray icon this session: %s", exc)
+            tray = None
+
+    return overlay, tray
