@@ -144,6 +144,11 @@ class HudRenderer:
         rgba[..., 3] = scaled
         return Image.fromarray(rgba, "RGBA")
 
+    @property
+    def theme(self) -> ReactorTheme:
+        """The reactor's theme, so a HudRenderer is a drop-in for a ReactorRenderer."""
+        return self.reactor.theme
+
     def font(self, size: int, bold: bool = False):
         key = (size, bold)
         if key not in self._fonts:

@@ -73,11 +73,11 @@ class LatencyTracker:
         clean = str(label or "").strip() or "unnamed"
         with self._lock:
             if self._t0 is None:
-                # Marking without a turn is a wiring bug; recover instead of raising.
-                self._log.warning(
-                    "mark(%r) called before start_turn(); starting the turn now.", clean
-                )
-                self._t0 = now
+                # No turn is open, so there is nothing to measure against. This is the
+                # normal case for the startup greeting, a chime, or a timer going off -
+                # none of which are turns - so it is not worth a warning.
+                self._log.debug("mark(%r) outside a turn; nothing to measure.", clean)
+                return 0.0
             elapsed_ms = (now - self._t0) * 1000.0
             if clean in self._marks:
                 self._log.debug(

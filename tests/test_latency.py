@@ -114,8 +114,21 @@ def test_first_audio_survives_a_logging_helper_that_raises(monkeypatch):
     assert tracker.first_audio() >= 0.0
 
 
-def test_marking_before_start_turn_recovers_instead_of_raising():
+def test_marking_before_start_turn_is_ignored_rather_than_invented():
+    """A measurement with no reference point is meaningless.
+
+    JARVIS speaks outside a turn all the time - the startup greeting, a chime, a
+    timer going off. Those used to open a turn on the spot and report a 0 ms
+    latency, which was both a warning in the console and a lie in the log.
+    """
     tracker = LatencyTracker()
+
+    assert tracker.mark("text") == 0.0
+    assert tracker.marks() == {}, "nothing should have been recorded"
+    assert not tracker.started
+
+    # And a real turn afterwards still measures correctly.
+    tracker.start_turn()
     assert tracker.mark("text") >= 0.0
     assert "text" in tracker.marks()
 
