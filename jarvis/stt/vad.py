@@ -9,17 +9,13 @@ knowing which it holds:
 * :class:`EnergySegmenter` is plain RMS against a calibrated noise floor. No model, no
   torch, numpy only — the fallback when Silero is missing.
 
-Both share the same timing rules, implemented once in :class:`_BaseSegmenter`:
-
-1. a pre-roll ring buffer of ``pre_roll_ms`` keeps the audio from *before* speech was
-   detected, so the first syllable survives;
-2. speech starts when the probability crosses ``threshold``;
-3. an utterance needs ``min_speech_ms`` of speech to count — a cough is discarded;
-4. it ends after ``silence_ms`` of continuous quiet;
-5. and it is cut off at ``max_utterance_s`` no matter what.
-
-The returned array is one float32 utterance, pre-roll included, and the segmenter
-resets itself so the next :meth:`push` starts clean.
+Both share the same timing rules, implemented once in :class:`_BaseSegmenter`: a
+pre-roll ring buffer of ``pre_roll_ms`` keeps the audio from *before* speech was
+detected so the first syllable survives; speech starts when the probability crosses
+``threshold``; an utterance needs ``min_speech_ms`` of speech to count, so a cough is
+discarded; it ends after ``silence_ms`` of continuous quiet; and it is cut off at
+``max_utterance_s`` no matter what. The returned array is one float32 utterance,
+pre-roll included, after which the segmenter resets itself.
 """
 
 from __future__ import annotations
@@ -57,8 +53,8 @@ _EPS = 1e-7
 def _mono(frame: np.ndarray) -> np.ndarray:
     """Coerce anything frame-shaped into a private, contiguous 1-D float32 copy.
 
-    The copy matters: buffered frames are kept until the utterance is complete, and the
-    caller is free to reuse the array it handed us in the meantime.
+    The copy matters: frames are kept until the utterance is complete, and the caller
+    is free to reuse the array it handed us in the meantime.
     """
     data = np.asarray(frame)
     if data.ndim > 1:
@@ -217,10 +213,10 @@ class _BaseSegmenter:
 class SpeechSegmenter(_BaseSegmenter):
     """Silero VAD over 16 kHz float32 frames. Feed frames, get a finished utterance.
 
-    Silero insists on exactly 512-sample chunks, while the microphone delivers 1280
-    (80 ms). Frames are therefore buffered internally, the model is run over every
-    complete 512-sample slice, and the frame's probability is the maximum across its
-    slices — the caller's block size never has to match the model's.
+    Silero insists on exactly 512-sample chunks while the microphone delivers 1280
+    (80 ms), so frames are buffered internally, the model runs over every complete
+    512-sample slice, and a frame's probability is the maximum across its slices. The
+    caller's block size never has to match the model's.
     """
 
     def __init__(
