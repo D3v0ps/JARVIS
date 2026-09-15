@@ -45,48 +45,42 @@ WEATHER_FAILURE = "I couldn't reach the weather service just now, sir."
 
 #: WMO present-weather codes (ww, 0-99) as phrases that fit "It's ... in <place>".
 WEATHER_CODES: dict[int, str] = {
-    0: "clear", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 4: "smoky",
-    5: "hazy", 6: "dusty", 7: "dusty and windy", 8: "dusty with whirls of sand",
-    9: "blowing up a duststorm", 10: "misty", 11: "patchily foggy",
-    12: "foggy in patches", 13: "flickering with distant lightning",
-    14: "raining without it reaching the ground", 15: "raining in the distance",
-    16: "raining close by", 17: "thundery without rain", 18: "squally",
-    19: "threatening a funnel cloud", 20: "clearing after drizzle",
-    21: "clearing after rain", 22: "clearing after snow", 23: "clearing after sleet",
-    24: "clearing after freezing rain", 25: "clearing after rain showers",
-    26: "clearing after snow showers", 27: "clearing after hail",
-    28: "clearing after fog", 29: "clearing after a thunderstorm",
-    30: "easing out of a duststorm", 31: "stuck in a duststorm",
-    32: "building into a duststorm", 33: "easing out of a heavy duststorm",
-    34: "in a heavy duststorm", 35: "building into a heavy duststorm",
-    36: "drifting with light snow", 37: "drifting with heavy snow",
-    38: "blowing snow about", 39: "blowing heavy snow about",
-    40: "foggy in the distance", 41: "foggy in patches", 42: "thinning out of fog",
-    43: "thinning out of dense fog", 44: "foggy", 45: "foggy",
-    46: "thinning out of freezing fog", 47: "densely foggy", 48: "foggy and freezing",
-    49: "densely foggy and freezing", 50: "drizzling on and off",
-    51: "drizzling lightly", 52: "drizzling", 53: "drizzling steadily",
-    54: "drizzling heavily on and off", 55: "drizzling heavily",
-    56: "drizzling and freezing", 57: "drizzling and freezing hard",
-    58: "drizzling with light rain", 59: "drizzling with rain",
-    60: "raining on and off", 61: "raining lightly", 62: "raining",
-    63: "raining steadily", 64: "raining heavily on and off", 65: "raining heavily",
-    66: "raining and freezing", 67: "raining and freezing hard", 68: "sleeting lightly",
-    69: "sleeting", 70: "snowing on and off", 71: "snowing lightly", 72: "snowing",
-    73: "snowing steadily", 74: "snowing heavily on and off", 75: "snowing heavily",
-    76: "sparkling with diamond dust", 77: "snowing grains of snow",
-    78: "snowing ice crystals", 79: "raining ice pellets",
-    80: "showery with light rain", 81: "showery with rain",
-    82: "showery with violent rain", 83: "showery with light sleet",
-    84: "showery with heavy sleet", 85: "showery with light snow",
-    86: "showery with heavy snow", 87: "showery with light soft hail",
-    88: "showery with heavy soft hail", 89: "showery with light hail",
-    90: "showery with heavy hail", 91: "raining lightly after a thunderstorm",
-    92: "raining heavily after a thunderstorm",
-    93: "snowing lightly after a thunderstorm",
-    94: "snowing heavily after a thunderstorm", 95: "thundery",
-    96: "thundery with light hail", 97: "thundery and heavy",
-    98: "thundery with a duststorm", 99: "thundery with heavy hail",
+    0: 'clear', 1: 'mainly clear', 2: 'partly cloudy', 3: 'overcast', 4: 'smoky', 5: 'hazy',
+    6: 'dusty', 7: 'dusty and windy', 8: 'dusty with whirls of sand',
+    9: 'blowing up a duststorm', 10: 'misty', 11: 'patchily foggy', 12: 'foggy in patches',
+    13: 'flickering with distant lightning', 14: 'raining without it reaching the ground',
+    15: 'raining in the distance', 16: 'raining close by', 17: 'thundery without rain',
+    18: 'squally', 19: 'threatening a funnel cloud', 20: 'clearing after drizzle',
+    21: 'clearing after rain', 22: 'clearing after snow', 23: 'clearing after sleet',
+    24: 'clearing after freezing rain', 25: 'clearing after rain showers',
+    26: 'clearing after snow showers', 27: 'clearing after hail', 28: 'clearing after fog',
+    29: 'clearing after a thunderstorm', 30: 'easing out of a duststorm',
+    31: 'stuck in a duststorm', 32: 'building into a duststorm',
+    33: 'easing out of a heavy duststorm', 34: 'in a heavy duststorm',
+    35: 'building into a heavy duststorm', 36: 'drifting with light snow',
+    37: 'drifting with heavy snow', 38: 'blowing snow about', 39: 'blowing heavy snow about',
+    40: 'foggy in the distance', 41: 'foggy in patches', 42: 'thinning out of fog',
+    43: 'thinning out of dense fog', 44: 'foggy', 45: 'foggy',
+    46: 'thinning out of freezing fog', 47: 'densely foggy', 48: 'foggy and freezing',
+    49: 'densely foggy and freezing', 50: 'drizzling on and off', 51: 'drizzling lightly',
+    52: 'drizzling', 53: 'drizzling steadily', 54: 'drizzling heavily on and off',
+    55: 'drizzling heavily', 56: 'drizzling and freezing', 57: 'drizzling and freezing hard',
+    58: 'drizzling with light rain', 59: 'drizzling with rain', 60: 'raining on and off',
+    61: 'raining lightly', 62: 'raining', 63: 'raining steadily',
+    64: 'raining heavily on and off', 65: 'raining heavily', 66: 'raining and freezing',
+    67: 'raining and freezing hard', 68: 'sleeting lightly', 69: 'sleeting',
+    70: 'snowing on and off', 71: 'snowing lightly', 72: 'snowing', 73: 'snowing steadily',
+    74: 'snowing heavily on and off', 75: 'snowing heavily', 76: 'sparkling with diamond dust',
+    77: 'snowing grains of snow', 78: 'snowing ice crystals', 79: 'raining ice pellets',
+    80: 'showery with light rain', 81: 'showery with rain', 82: 'showery with violent rain',
+    83: 'showery with light sleet', 84: 'showery with heavy sleet',
+    85: 'showery with light snow', 86: 'showery with heavy snow',
+    87: 'showery with light soft hail', 88: 'showery with heavy soft hail',
+    89: 'showery with light hail', 90: 'showery with heavy hail',
+    91: 'raining lightly after a thunderstorm', 92: 'raining heavily after a thunderstorm',
+    93: 'snowing lightly after a thunderstorm', 94: 'snowing heavily after a thunderstorm',
+    95: 'thundery', 96: 'thundery with light hail', 97: 'thundery and heavy',
+    98: 'thundery with a duststorm', 99: 'thundery with heavy hail',
 }
 
 #: Domain labels that are never the brand part of a host name.
@@ -102,6 +96,9 @@ _VOWELS = set("aeiouy")
 _LEADING_DATE_RE = re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2},?\s+\d{4}\s*(?:\.{3}|…|—|-)\s*")
 _LEADING_ELLIPSIS_RE = re.compile(r"^\s*(?:\.{3}|…)\s*")
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+#: Trailing characters removed from a spoken clause, which continues into "according to".
+_CLAUSE_TRIM = " .,;:!?-"
 
 _UNITS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
           "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
@@ -143,13 +140,11 @@ def _load_ddgs() -> Callable[..., Any] | None:
     """
     try:
         from ddgs import DDGS  # type: ignore[import-not-found]
-
         return DDGS
     except ImportError:
         _log.debug("The 'ddgs' package is missing; trying 'duckduckgo_search'.")
     try:
         from duckduckgo_search import DDGS  # type: ignore[import-not-found]
-
         return DDGS
     except ImportError:
         _log.warning("No DuckDuckGo search package is installed; web search is off.")
@@ -182,25 +177,17 @@ def _normalise_results(raw: Any) -> list[dict[str, str]]:
     except TypeError:
         _log.warning("The search package returned something I cannot iterate over.")
         return []
-    rows: list[dict[str, str]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        row = {"title": _field(item, _TITLE_KEYS), "url": _field(item, _URL_KEYS),
-               "body": _field(item, _BODY_KEYS)}
-        if any(row.values()):
-            rows.append(row)
-    return rows
+    rows = [{"title": _field(item, _TITLE_KEYS), "url": _field(item, _URL_KEYS),
+             "body": _field(item, _BODY_KEYS)} for item in items if isinstance(item, dict)]
+    return [row for row in rows if any(row.values())]
 
 
 def _brand(labels: list[str]) -> str:
     """The brand label of a host name, skipping ``www``, ``co.uk`` and friends."""
     while labels and labels[0] in _GENERIC_LABELS:
         labels.pop(0)
-    if not labels:
-        return ""
-    if len(labels) == 1:
-        return labels[0]
+    if len(labels) < 2:
+        return labels[0] if labels else ""
     if labels[-2] not in _GENERIC_LABELS:
         return labels[-2]
     return labels[-3] if len(labels) >= 3 else labels[0]
@@ -230,14 +217,14 @@ def _first_clause(text: str, limit: int = _SPOKEN_CLAUSE_CHARS) -> str:
         return ""
     candidate = _SENTENCE_END_RE.split(clean)[0].strip() or clean
     if len(candidate) <= limit:
-        return candidate.rstrip(" ,;:-")
+        return candidate.rstrip(_CLAUSE_TRIM)
     window = candidate[:limit]
     for separator in (";", ",", " — ", " - "):
         cut = window.rfind(separator)
         if cut > limit // 2:
-            return window[:cut].rstrip(" ,;:-")
+            return window[:cut].rstrip(_CLAUSE_TRIM)
     cut = window.rfind(" ")
-    return window[: cut if cut >= limit // 2 else limit].rstrip(" ,;:-") + "…"
+    return window[: cut if cut >= limit // 2 else limit].rstrip(_CLAUSE_TRIM) + "…"
 
 
 def _search_detail(query: str, rows: list[dict[str, str]]) -> str:
@@ -256,8 +243,7 @@ def _search_detail(query: str, rows: list[dict[str, str]]) -> str:
     "web_search",
     description=(
         "Search the web with DuckDuckGo and answer from the best result. Use it for "
-        "facts you do not know, current events, prices, opening hours and anything "
-        "that changes over time."
+        "facts you do not know, current events, prices and opening hours."
     ),
     parameters={
         "type": "object",
@@ -274,8 +260,8 @@ def _search_detail(query: str, rows: list[dict[str, str]]) -> str:
 def web_search(ctx: ToolContext, args: dict) -> ToolResult:
     """Search the web and answer in one sentence that credits its source.
 
-    The summary leads with the most relevant snippet, trimmed to a clause, because a
-    list of links is useless out loud. Titles, links and snippets go to ``detail``.
+    The summary leads with the best snippet, trimmed to a clause, because a list of
+    links is useless out loud. Titles, links and snippets go to ``detail``.
     """
     query = " ".join(str(args.get("query") or "").split())
     if not query:
@@ -358,11 +344,12 @@ def _weather_detail(place: str, current: dict, daily: dict) -> str:
     fields = [("temperature_2m", "temperature (C)"), ("apparent_temperature", "feels like (C)"),
               ("relative_humidity_2m", "humidity (%)"), ("precipitation", "precipitation (mm)"),
               ("weather_code", "WMO code"), ("wind_speed_10m", "wind (m/s)")]
+    daily_fields = [("temperature_2m_max", "today's high (C)"),
+                    ("temperature_2m_min", "today's low (C)"),
+                    ("precipitation_probability_max", "rain chance today (%)")]
     lines = [f"place: {place}"]
     lines += [f"{label}: {current.get(key)}" for key, label in fields]
-    lines.append(f"today's high (C): {_first(daily.get('temperature_2m_max'))}")
-    lines.append(f"today's low (C): {_first(daily.get('temperature_2m_min'))}")
-    lines.append(f"rain chance today (%): {_first(daily.get('precipitation_probability_max'))}")
+    lines += [f"{label}: {_first(daily.get(key))}" for key, label in daily_fields]
     return "\n".join(lines)
 
 
@@ -370,7 +357,7 @@ def _weather_detail(place: str, current: dict, daily: dict) -> str:
     "weather",
     description=(
         "Report the current weather and today's high and low for a city, in Celsius. "
-        "Leave the city out to use the user's home city from the configuration."
+        "Leave the city out to use the user's home city."
     ),
     parameters={
         "type": "object",
@@ -387,8 +374,7 @@ def _weather_detail(place: str, current: dict, daily: dict) -> str:
 def weather(ctx: ToolContext, args: dict) -> ToolResult:
     """Answer the weather in one sentence: condition, temperature and context.
 
-    Two keyless Open-Meteo calls — geocoding for the coordinates, then the forecast.
-    Units are metric throughout: Celsius and metres per second.
+    Two keyless Open-Meteo calls — geocoding, then the forecast. Metric throughout.
     """
     city = " ".join(str(args.get("city") or "").split())
     if not city:
@@ -402,7 +388,8 @@ def weather(ctx: ToolContext, args: dict) -> ToolResult:
     if geo is None:
         return ToolResult.fail(WEATHER_FAILURE, error)
     places = geo.get("results")
-    place = places[0] if isinstance(places, list) and places and isinstance(places[0], dict) else None
+    place = places[0] if isinstance(places, list) and places else None
+    place = place if isinstance(place, dict) else None
     latitude = _number(place.get("latitude")) if place else None
     longitude = _number(place.get("longitude")) if place else None
     if place is None or latitude is None or longitude is None:
