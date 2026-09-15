@@ -40,6 +40,54 @@ mic → wake word → VAD → Whisper → Ollama (+tools) → Kokoro → speaker
 
 ---
 
+## 1b. The face
+
+A small arc reactor sits in the corner of the screen. It is not a status light —
+you can watch him work:
+
+```
+ ◉   LISTENING                                        
+     › run a powershell command to show the five biggest files in downloads
+
+ ◉   WORKING                                          
+     › confirm
+     ▸ run_powershell
+
+ ◉   SPEAKING                                   1.42 s
+     ✓ run_powershell  412 ms
+     Done, sir. The largest is a 2.4 gigabyte video.
+```
+
+Motion carries the meaning, so you can read his state from across the room
+without reading a word:
+
+| State | What the ring does |
+|---|---|
+| idle | breathes slowly, dim, and the panel disappears entirely |
+| listening | the eight coils follow your actual microphone level |
+| working | a comet sweeps around the ring |
+| speaking | waves leave the core, in time with his voice |
+| paused | grey and still |
+
+The panel shows what he heard, which tool is running, what it cost in
+milliseconds, what he is saying as it streams, and the turn's total latency.
+A guarded action puts **Say confirm** in amber at the bottom. Everything fades
+out after nine seconds, leaving just the ring.
+
+It is drawn with `UpdateLayeredWindow` and a premultiplied bitmap — a genuine
+per-pixel alpha channel, which is what makes the glow soft and the edges clean.
+Drag it anywhere; it remembers. Right-click for pause, quit, and a click-through
+toggle if you would rather it never caught a click. On anything that is not
+Windows it falls back to a plain tkinter ring.
+
+See it on its own, before committing to a full session:
+
+```powershell
+.venv\Scripts\python -m jarvis --overlay-test
+```
+
+---
+
 ## 2. Install — double-click, that is the whole procedure
 
 You do not need to know what PowerShell, pip or a virtual environment is. You need a
@@ -131,6 +179,7 @@ Check the machine at any time:
 | `python -m jarvis --text` | type instead of talk — same brain, same tools |
 | `python -m jarvis --say "Good evening, sir."` | TTS smoke test |
 | `python -m jarvis --list-devices` | audio device names for `config.yaml` |
+| `python -m jarvis --overlay-test` | cycle the overlay through every state for ten seconds |
 | `python -m jarvis --preflight` | environment doctor |
 | `python -m jarvis --config other.yaml` | alternative configuration |
 
