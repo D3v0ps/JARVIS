@@ -40,26 +40,61 @@ mic → wake word → VAD → Whisper → Ollama (+tools) → Kokoro → speaker
 
 ---
 
-## 2. Install
+## 2. Install — double-click, that is the whole procedure
 
-Requirements: Windows 11, Python 3.13 on `PATH`, an NVIDIA GPU is nice but not required.
+You do not need to know what PowerShell, pip or a virtual environment is. You need a
+mouse and an internet connection.
+
+> ### 1. Download this folder and unzip it, all of it.
+> ### 2. Double-click **`Install-JARVIS.exe`**.
+> ### 3. Say yes to the Windows prompt, then wait.
+> ### 4. Double-click **JARVIS** on your desktop and say *"Hey Jarvis."*
+
+That is it. The installer does the rest:
+
+| It checks | And if it is missing |
+|---|---|
+| Windows version, RAM, free disk | warns you before it starts downloading 15 GB |
+| Python 3.13 | installs it |
+| Your graphics card | reads the VRAM and picks the model that fits — see below |
+| Ollama | installs it and starts the service |
+| The language model | pulls it (several GB — this is the slow part) |
+| The Python environment | creates `.venv` and installs every dependency |
+| The voice | downloads the Kokoro British voice and the wake-word model |
+| `config.yaml` | writes in what it found, so nothing is left to guess |
+| Shortcuts | puts **JARVIS** on your desktop and in the Start menu |
+| Autostart | asks whether he should come online when you log in |
+
+Run it twice and nothing breaks — every step checks whether it is already done, so it
+also works as a repair tool. Everything it does is written to `logs\install.log`.
+
+**Which model you get** is decided by your graphics card, because the model and Whisper
+have to share the VRAM:
+
+| Your VRAM | Model | Speech recognition |
+|---|---|---|
+| 16 GB or more | `qwen3:14b` — the sharpest that still leaves room | Whisper `medium` |
+| 8–15 GB | `qwen3:8b` — the sweet spot for a sub-two-second answer | Whisper `small` |
+| 4–7 GB | `qwen3:4b` | Whisper `base` |
+| No NVIDIA card | `qwen3:4b` on the CPU — slower, but it works | Whisper `base` |
+
+Want to override it: `Install-JARVIS.exe -Model qwen3:14b`.
+
+### If Windows says "Windows protected your PC"
+
+It will, the first time. The installer is not signed with a commercial certificate
+(those cost money and this is your own software). Click **More info** → **Run anyway**.
+If you would rather not, right-click `install.ps1` → **Run with PowerShell** does exactly
+the same thing.
+
+### The manual path, if you prefer it
 
 ```powershell
-git clone <this repo> JARVIS
-cd JARVIS
-
-# 1. Ollama and the model (about 5 GB)
+winget install Python.Python.3.13
 winget install Ollama.Ollama
 ollama pull qwen3:8b
-
-# 2. Everything else — creates .venv, installs dependencies, runs the preflight checks
-.\start-jarvis.bat
-```
-
-The first launch also needs the voice model:
-
-```powershell
-.venv\Scripts\python scripts\fetch_models.py            # Kokoro voice + wake word models
+.\start-jarvis.bat                                      # builds the venv and installs deps
+.venv\Scripts\python scripts\fetch_models.py            # the voice
 .venv\Scripts\python scripts\fetch_models.py --swedish  # optional Swedish voice
 ```
 
@@ -70,12 +105,28 @@ Check the machine at any time:
 .venv\Scripts\python -m jarvis --preflight --fix # also write the detected values into config.yaml
 ```
 
+### Installer options
+
+| Flag | Effect |
+|---|---|
+| `-Silent` | no questions, take every default |
+| `-Swedish` | also download the Piper Swedish voice |
+| `-Autostart` | register the logon task without asking |
+| `-NoLaunch` | do not start JARVIS when it finishes |
+| `-Model qwen3:14b` | force a specific model |
+| `-SkipModels` | skip the voice download |
+
 ### Start it your way
+
+| Double-click | What it does |
+|---|---|
+| **JARVIS.exe** | brings him online — this is the one you want |
+| **Install-JARVIS.exe** | installs or repairs everything |
 
 | Command | What it does |
 |---|---|
-| `start-jarvis.bat` | the whole thing: voice, overlay, tray |
-| `python -m jarvis` | same, from an activated venv |
+| `start-jarvis.bat` | the same as JARVIS.exe, without the icon |
+| `python -m jarvis` | from an activated venv |
 | `python -m jarvis --no-ui` | console only, no overlay |
 | `python -m jarvis --text` | type instead of talk — same brain, same tools |
 | `python -m jarvis --say "Good evening, sir."` | TTS smoke test |
@@ -83,12 +134,9 @@ Check the machine at any time:
 | `python -m jarvis --preflight` | environment doctor |
 | `python -m jarvis --config other.yaml` | alternative configuration |
 
-Autostart at logon (optional):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
-powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1
-```
+To uninstall: delete the folder, then `winget uninstall Ollama.Ollama` if you want the
+model gone too. JARVIS writes nothing outside his own folder except the two shortcuts and,
+if you asked for it, the logon task (`scripts\uninstall-autostart.ps1` removes that).
 
 ---
 

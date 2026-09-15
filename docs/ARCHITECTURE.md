@@ -580,6 +580,13 @@ python -m jarvis --say "text"    # TTS smoke test
 python -m jarvis --no-ui         # console only
 python -m jarvis --config path   # alternative config file
 ```
+Preflight sub-flags, used by `install.ps1` so the installer never has to edit YAML itself:
+```
+python -m jarvis --preflight --fix                  # write detected values into config.yaml
+python -m jarvis --preflight --fix --set-model qwen3:14b --set-whisper medium
+```
+`--set-model` writes `brain.model`, `--set-whisper` writes `stt.model`; both imply `--fix`.
+Unknown flags must not crash the installer - print the usage and exit 2.
 
 ## 16. `jarvis/preflight.py`
 ```python
@@ -587,8 +594,17 @@ python -m jarvis --config path   # alternative config file
 class CheckResult: name: str; ok: bool; detail: str; fix: str = ""
 def run_checks(cfg: Config, *, fix: bool = False) -> list[CheckResult]
 def detect_vram() -> tuple[float | None, str | None]     # nvidia-smi --query-gpu=memory.total,name
+def apply_fixes(cfg: Config, *, model: str | None = None, whisper: str | None = None) -> list[str]
+    """Write system.vram_gb, system.gpu_name and, when given, brain.model and stt.model
+    into config.yaml. Returns a list of human-readable changes. Never raises - a read-only
+    config file becomes a warning, because the installer must still finish."""
 def main(argv=None) -> int
 ```
+`main()` accepts `--fix`, `--set-model NAME`, `--set-whisper SIZE` and `--json`.
+Exit code 0 when everything essential passed, 1 when something essential is missing
+(no Python deps, no Ollama daemon, no model), 2 on bad arguments. A missing *optional*
+piece (no GPU, no Swedish voice) is a warning, not a failure - the installer treats a
+non-zero exit as "tell the user" and carries on.
 Checks: Python version, venv active, required packages importable, ollama binary + daemon +
 `qwen3:8b` present, GPU/VRAM (writes `system.vram_gb` + `system.gpu_name` into config.yaml),
 STT model choice, Kokoro model files present (points at `scripts/fetch_models.py`),

@@ -21,3 +21,7 @@ models/*
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Installer build artifacts (the .exe files themselves are committed)
+installer/*.o
+installer/*.res
