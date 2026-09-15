@@ -175,6 +175,7 @@ Everything you need is a double-click. No terminal, ever.
 | **Check-JARVIS.bat** | reports what is installed and what is missing |
 | **Test-Overlay.bat** | shows the arc reactor cycling through every state |
 | **Test-Voice.bat** | speaks one line, so you know the voice works |
+| **Get-Voice.bat** | downloads the British Kokoro voice and the wake-word models |
 
 | Command | What it does |
 |---|---|

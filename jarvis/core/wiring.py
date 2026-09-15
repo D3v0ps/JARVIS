@@ -140,6 +140,9 @@ def build(
     except Exception as exc:  # noqa: BLE001 - an optional tool must not break startup
         log.debug("deep_think is unavailable: %s", exc)
 
+    # The configured model may not be the one that is actually pulled.
+    resolve_model(client, cfg, log)
+
     from jarvis.brain.brain import Brain
 
     brain = Brain(
@@ -205,6 +208,14 @@ def _build_wake(cfg: Config, log: logging.Logger, text_mode: bool, problems: lis
 
 
 def _build_segmenter(cfg: Config, log: logging.Logger) -> Any:
+    # Silero loads through torch.jit.load, which torch now warns about on every start.
+    # It is torch talking to silero, not anything the user can act on, so keep it out
+    # of a console that is supposed to read calmly.
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore", message=r".*torch\.jit\.load.*", category=FutureWarning
+    )
     from jarvis.stt.vad import EnergySegmenter, SpeechSegmenter
 
     kwargs = dict(
@@ -287,3 +298,86 @@ def build_face(
             tray = None
 
     return overlay, tray
+
+
+# --- choosing a model that is actually there -------------------------------------------
+#: Rough VRAM cost of a q4-quantised model: parameters * 0.6 GB, plus overhead.
+_GB_PER_BILLION = 0.6
+_MODEL_OVERHEAD_GB = 1.6
+
+
+def _parameter_size(tag: str) -> float:
+    """Billions of parameters from a model tag: qwen3:14b -> 14, llama3.1:8b-q4 -> 8."""
+    import re
+
+    suffix = tag.split(":", 1)[1] if ":" in tag else tag
+    match = re.search(r"(\d+(?:\.\d+)?)\s*b\b", suffix.lower())
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def choose_installed_model(
+    wanted: str, installed: list[str], vram_gb: float | None = None
+) -> str | None:
+    """Pick the best model that is actually pulled when ``wanted`` is not.
+
+    Prefers the same family - someone who pulled qwen3:14b wants qwen3 - and within
+    it the largest that still fits the card. Falls back to anything installed rather
+    than leaving the assistant with nothing to think with.
+    """
+    if not installed:
+        return None
+    if wanted in installed:
+        return wanted
+
+    def fits(tag: str) -> bool:
+        if vram_gb is None:
+            return True  # the user pulled it deliberately; do not second-guess them
+        size = _parameter_size(tag)
+        if size <= 0:
+            return True
+        return (size * _GB_PER_BILLION + _MODEL_OVERHEAD_GB) <= float(vram_gb) + 0.5
+
+    base = wanted.split(":", 1)[0].lower()
+    family = [tag for tag in installed if tag.split(":", 1)[0].lower() == base]
+    for candidates in (family, installed):
+        usable = [tag for tag in candidates if fits(tag)]
+        pool = usable or candidates
+        if pool:
+            return max(pool, key=_parameter_size)
+    return None
+
+
+def resolve_model(client: OllamaClient, cfg: Config, log: logging.Logger) -> str | None:
+    """Point the client at a model that exists, and say so.
+
+    The configured model may simply not be pulled - config.yaml still saying qwen3:8b
+    on a machine where the installer pulled qwen3:14b is exactly the case this exists
+    for. Nothing is written to disk; the choice applies to this run and is logged.
+    """
+    wanted = str(cfg.get("brain.model", "qwen3:8b"))
+    if not client.available():
+        return None
+    if client.has_model(wanted):
+        return wanted
+
+    installed = client.models()
+    choice = choose_installed_model(wanted, installed, cfg.get("system.vram_gb"))
+    if not choice:
+        log.warning(
+            "%s is not pulled and no other model is installed. Run: ollama pull %s",
+            wanted, wanted,
+        )
+        return None
+    if choice != wanted:
+        client.model = choice
+        log.warning(
+            "%s is not pulled; using %s instead. Set brain.model to %s in config.yaml "
+            "to make that permanent.",
+            wanted, choice, choice,
+        )
+    return choice

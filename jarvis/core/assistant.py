@@ -326,6 +326,7 @@ class Assistant:
             self._hud.latency_ms = self.parts.latency.marks().get("first audio")
             self._hud.touch()
         self.log.info("Turn complete: %s", self.parts.latency.summary())
+        self.parts.latency.end_turn()
 
     def _on_sentence(self, sentence: str) -> None:
         self.parts.speaker.enqueue(sentence)

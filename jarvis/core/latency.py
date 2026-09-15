@@ -46,6 +46,12 @@ class LatencyTracker:
         self._first_audio_ms: float | None = None
 
     # --- lifecycle -------------------------------------------------------------------
+    def end_turn(self) -> None:
+        """Close the turn, so speech that follows is not measured against it."""
+        with self._lock:
+            self._t0 = None
+            self._first_audio_ms = None
+
     def start_turn(self) -> None:
         """Reset the tracker and stamp t0. Call this at end of speech."""
         with self._lock:
@@ -86,8 +92,15 @@ class LatencyTracker:
 
         Later calls within the same turn are ignored and return the first value, so a
         speaker that plays several sentences still reports a single headline number.
+
+        Speech that is not part of a turn - the startup greeting, a timer going off,
+        a chime - is not a measurement of anything, so it is quietly ignored rather
+        than reported as a 0 ms turn.
         """
         with self._lock:
+            if self._t0 is None:
+                self._log.debug("first_audio() outside a turn; nothing to measure.")
+                return 0.0
             if self._first_audio_ms is not None:
                 return self._first_audio_ms
             elapsed_ms = self.mark(FIRST_AUDIO_LABEL)

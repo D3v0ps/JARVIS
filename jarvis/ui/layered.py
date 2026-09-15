@@ -94,6 +94,7 @@ class LayeredOverlay:
         self.height = self.renderer.height
         self.click_through = bool(cfg.get("ui.click_through", False))
 
+        self._u32 = self._g32 = self._k32 = None
         self._hwnd = None
         self._thread: threading.Thread | None = None
         self._running = threading.Event()
@@ -162,9 +163,9 @@ class LayeredOverlay:
                 pass
             self._unsubscribe = None
         hwnd = self._hwnd
-        if hwnd:
+        if hwnd and self._u32 is not None:
             try:
-                ctypes.windll.user32.PostMessageW(hwnd, WM_QUIT_OVERLAY, 0, 0)
+                self._u32.PostMessageW(hwnd, WM_QUIT_OVERLAY, 0, 0)
             except Exception:  # noqa: BLE001
                 pass
         if self._thread and self._thread.is_alive():
@@ -208,25 +209,31 @@ class LayeredOverlay:
             self._destroy_window()
 
     def _create_window(self) -> None:
-        user32 = ctypes.windll.user32
-        # Per-monitor DPI awareness, so the ring is crisp on a scaled display.
-        try:
-            user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        except Exception:  # noqa: BLE001 - older Windows, harmless
-            pass
-
-        from jarvis.ui import _win32 as w  # structures live next door
+        from jarvis.ui import _win32 as w  # structures and prototypes live next door
 
         self._w = w
+        # Declaring every signature is not optional. Without argtypes, ctypes marshals
+        # each argument as a C int, and the first 64-bit handle - CreateWindowExW's
+        # hInstance - raises "int too long to convert".
+        self._u32, self._g32, self._k32 = w.bind()
+        user32 = self._u32
+
+        # Per-monitor DPI awareness, so the ring is crisp on a scaled display.
+        if hasattr(user32, "SetProcessDpiAwarenessContext"):
+            try:
+                user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+            except Exception:  # noqa: BLE001 - older Windows, harmless
+                pass
+
         self._wndproc_ref = w.WNDPROC(self._wndproc)
         class_name = "JarvisReactorOverlay"
 
         wndclass = w.WNDCLASSEX()
         wndclass.cbSize = ctypes.sizeof(w.WNDCLASSEX)
         wndclass.lpfnWndProc = self._wndproc_ref
-        wndclass.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+        wndclass.hInstance = self._k32.GetModuleHandleW(None)
         wndclass.lpszClassName = class_name
-        wndclass.hCursor = user32.LoadCursorW(None, ctypes.c_wchar_p(32512))  # IDC_ARROW
+        wndclass.hCursor = user32.LoadCursorW(None, w.cursor_resource(32512))  # IDC_ARROW
         user32.RegisterClassExW(ctypes.byref(wndclass))  # a duplicate class is fine
 
         x, y = self._initial_position()
@@ -237,7 +244,7 @@ class LayeredOverlay:
             None, None, wndclass.hInstance, None,
         )
         if not self._hwnd:
-            raise OSError(f"CreateWindowExW failed: {ctypes.GetLastError()}")
+            raise OSError(f"CreateWindowExW failed: {ctypes.get_last_error()}")
         self._position = [x, y]
         if self.click_through:
             self._set_click_through(True)
@@ -247,7 +254,7 @@ class LayeredOverlay:
         self._paint()
 
     def _initial_position(self) -> tuple[int, int]:
-        user32 = ctypes.windll.user32
+        user32 = self._u32
         saved = self.cfg.get("ui.position")
         screen_w = user32.GetSystemMetrics(0)
         screen_h = user32.GetSystemMetrics(1)
@@ -264,9 +271,9 @@ class LayeredOverlay:
         return screen_w - self.width - margin, screen_h - self.height - margin - 48
 
     def _destroy_window(self) -> None:
-        if self._hwnd:
+        if self._hwnd and self._u32 is not None:
             try:
-                ctypes.windll.user32.DestroyWindow(self._hwnd)
+                self._u32.DestroyWindow(self._hwnd)
             except Exception:  # noqa: BLE001
                 pass
             self._hwnd = None
@@ -274,7 +281,7 @@ class LayeredOverlay:
     # --- painting --------------------------------------------------------------------
     def _paint(self) -> None:
         """Render one frame and hand it to the compositor."""
-        gdi32, user32 = ctypes.windll.gdi32, ctypes.windll.user32
+        gdi32, user32 = self._g32, self._u32
         w = self._w
 
         t = time.perf_counter() - self._started_at
@@ -321,7 +328,7 @@ class LayeredOverlay:
 
     def _pump(self) -> None:
         """Message loop and frame clock in one, so nothing needs a Win32 timer."""
-        user32 = ctypes.windll.user32
+        user32 = self._u32
         w = self._w
         msg = w.MSG()
         frame_time = 1.0 / FPS
@@ -343,7 +350,7 @@ class LayeredOverlay:
 
     # --- input -----------------------------------------------------------------------
     def _wndproc(self, hwnd, message, wparam, lparam):
-        user32 = ctypes.windll.user32
+        user32 = self._u32
         try:
             if message == WM_LBUTTONDOWN:
                 user32.SetCapture(hwnd)
@@ -374,7 +381,7 @@ class LayeredOverlay:
 
     def _cursor_pos(self) -> tuple[int, int]:
         point = self._w.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+        self._u32.GetCursorPos(ctypes.byref(point))
         return int(point.x), int(point.y)
 
     def _remember_position(self) -> None:
@@ -387,7 +394,7 @@ class LayeredOverlay:
             self.log.debug("Could not save the overlay position: %s", exc)
 
     def _context_menu(self, hwnd) -> None:
-        user32 = ctypes.windll.user32
+        user32 = self._u32
         menu = user32.CreatePopupMenu()
         paused = self.state.state is AssistantState.PAUSED
         user32.AppendMenuW(menu, MF_STRING, IDM_PAUSE, "Resume" if paused else "Pause")
@@ -426,7 +433,7 @@ class LayeredOverlay:
         faint backing as well, for anyone who wants the overlay to be purely
         something to look at.
         """
-        user32 = ctypes.windll.user32
+        user32 = self._u32
         GWL_EXSTYLE = -20
         get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
         set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
@@ -441,7 +448,7 @@ class LayeredOverlay:
             self.log.debug("Could not change the click-through style: %s", exc)
 
     def _initial_position_default(self) -> tuple[int, int]:
-        user32 = ctypes.windll.user32
+        user32 = self._u32
         margin = 28
         return (
             user32.GetSystemMetrics(0) - self.width - margin,

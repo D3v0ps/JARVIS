@@ -175,3 +175,22 @@ def test_two_threads_reporting_first_audio_agree_on_one_value():
 
     assert len(seen) == 2
     assert seen[0] == seen[1]
+
+
+def test_speech_outside_a_turn_is_not_measured():
+    """The startup greeting is not a turn, and reporting it as 0 ms was noise."""
+    from jarvis.core.latency import LatencyTracker
+
+    tracker = LatencyTracker()
+    assert tracker.first_audio() == 0.0
+    assert tracker.marks() == {}
+
+
+def test_end_turn_closes_the_measurement():
+    from jarvis.core.latency import LatencyTracker
+
+    tracker = LatencyTracker()
+    tracker.start_turn()
+    assert tracker.first_audio() >= 0.0
+    tracker.end_turn()
+    assert tracker.first_audio() == 0.0, "speech after the turn must not be measured"

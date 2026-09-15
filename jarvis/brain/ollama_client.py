@@ -210,6 +210,10 @@ class OllamaClient:
         # One side named the family only, or asked for the implicit "latest" tag.
         return not left_tag or not right_tag or "latest" in (left_tag, right_tag)
 
+    def models(self, timeout: float = TAGS_TIMEOUT) -> list[str]:
+        """Every model the daemon has pulled. Empty when it cannot be asked."""
+        return list(self._tags(timeout) or [])
+
     def has_model(self, name: str | None = None) -> bool:
         """True when ``name`` (default: the configured model) is installed. Never raises."""
         wanted = (name or self.model or "").strip()
