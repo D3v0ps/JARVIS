@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# JARVIS runtime state
+logs/*.log
+logs/*.log.*
+memory.json
+config.local.yaml
+
+# Downloaded model weights (hundreds of MB — fetched by scripts/fetch_models.py)
+models/*
+!models/README.md
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

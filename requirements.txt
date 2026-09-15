@@ -1,0 +1,42 @@
+# JARVIS — fully local voice assistant (Windows 11, Python 3.13)
+# Install:  .venv\Scripts\python -m pip install -r requirements.txt
+
+# --- core ---
+numpy>=1.26
+PyYAML>=6.0
+requests>=2.31
+
+# --- audio I/O (bundled PortAudio wheels; never PyAudio) ---
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# --- wake word ---
+openwakeword>=0.6.0
+onnxruntime>=1.17
+
+# --- speech to text ---
+faster-whisper>=1.0.3
+silero-vad>=5.1
+
+# --- text to speech ---
+kokoro-onnx>=0.4.0
+pyttsx3>=2.90            ; sys_platform == "win32"   # SAPI fallback
+piper-tts>=1.2.0                                      # optional Swedish voice
+
+# --- tools ---
+psutil>=5.9              # system_status
+ddgs>=9.0                # web_search (keyless DuckDuckGo)
+pillow>=10.0             # screenshot
+pycaw>=20240210          ; sys_platform == "win32"   # volume
+comtypes>=1.2            ; sys_platform == "win32"   # pycaw dependency
+pygetwindow>=0.0.9       ; sys_platform == "win32"   # close_app
+
+# --- UI ---
+pystray>=0.19.5          # tray icon (tkinter ships with Python)
+
+# --- GPU acceleration for faster-whisper (harmless on CPU-only machines) ---
+nvidia-cublas-cu12       ; sys_platform == "win32"
+nvidia-cudnn-cu12        ; sys_platform == "win32"
+
+# --- dev/test only ---
+pytest>=8.0

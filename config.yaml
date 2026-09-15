@@ -1,0 +1,116 @@
+# JARVIS configuration — everything is local. Edit and restart.
+# Values marked "auto" are detected at startup (see `python -m jarvis preflight`).
+
+language: auto              # auto | en | sv  — auto follows what you speak
+
+assistant:
+  wake_greeting: true       # say the acknowledge_phrase when woken
+  acknowledge_phrase: "Sir?"
+  startup_greeting: true    # "Good evening, sir. All systems online."
+  conversation_timeout: 20  # seconds of follow-up time without the wake word
+  confirmation_timeout: 10  # seconds to say "confirm" on a guarded action
+  safety_mode: normal       # normal | strict  (strict also guards type_text and close_app)
+  max_tool_rounds: 4        # tool-call loops per turn before the model must answer
+
+audio:
+  input_device: null        # null = system default; or a name/substring, or an index
+  output_device: null
+  sample_rate: 16000        # capture rate — do not change, the models expect 16 kHz
+  block_size: 1280          # 80 ms frames (openWakeWord's native chunk)
+  chime_volume: 0.35
+  output_volume: 1.0
+  barge_in: true            # interrupt Jarvis by speaking over him
+  barge_in_speech_ms: 400   # sustained speech required to cut him off
+  barge_in_grace_ms: 350    # ignore the first moments of his own voice
+
+wake:
+  enabled: true
+  model: hey_jarvis         # bundled openWakeWord model
+  sensitivity: 0.5          # 0..1 — raise if it triggers on the TV, lower if it misses you
+  cooldown: 2.0             # seconds before the wake word can fire again
+  framework: onnx           # onnx | tflite
+
+vad:
+  threshold: 0.5            # Silero speech probability
+  silence_ms: 700           # end of utterance after this much quiet
+  min_speech_ms: 250        # ignore shorter blips
+  max_utterance_s: 15       # hard cap
+  pre_roll_ms: 300          # audio kept from before speech was detected
+
+stt:
+  model: auto               # auto | tiny | base | small | medium | large-v3  (auto picks by VRAM)
+  device: auto              # auto | cuda | cpu
+  compute_type: auto        # auto | float16 | int8 | int8_float16
+  beam_size: 1              # 1 = fastest
+  vad_filter: false         # Silero already segmented the audio
+
+brain:
+  host: http://127.0.0.1:11434
+  model: qwen3:8b
+  deep_model: null          # optional bigger model for deep_think, e.g. qwen3:14b
+  think: false              # never think out loud for voice
+  keep_alive: -1            # keep the model resident forever
+  num_ctx: 8192
+  temperature: 0.6
+  history_turns: 12         # rolling conversation window
+  request_timeout: 120
+  warm_on_start: true
+
+tts:
+  engine: kokoro            # kokoro | piper | sapi
+  voice: bm_george          # bm_george | bm_lewis | bf_emma
+  speed: 1.0
+  kokoro_model: models/kokoro-v1.0.onnx
+  kokoro_voices: models/voices-v1.0.bin
+  piper_model: models/sv_SE-nst-medium.onnx   # used when language resolves to Swedish
+  fallback: sapi            # engine to fall back to if the primary one fails
+
+ui:
+  overlay: true
+  tray: true
+  ring_size: 180
+  opacity: 0.92
+  always_on_top: true
+  position: null            # [x, y] — remembered when you drag the ring
+  theme:
+    idle: "#1b3a4b"
+    listening: "#29b6f6"
+    thinking: "#ffb300"
+    speaking: "#4dd0e1"
+    paused: "#616161"
+
+tools:
+  default_city: Stockholm
+  screenshot_dir: null      # null = Pictures\Jarvis
+  powershell_timeout: 30
+  search_results: 3
+  file_search_dirs: [Desktop, Documents, Downloads]
+  apps:
+    spotify: spotify
+    chrome: chrome
+    edge: msedge
+    firefox: firefox
+    code: code
+    vscode: code
+    steam: steam
+    discord: discord
+    explorer: explorer
+    terminal: wt
+    powershell: powershell
+    settings: "ms-settings:"
+    calculator: calc
+    notepad: notepad
+    task manager: taskmgr
+    obs: obs64
+    youtube: "https://www.youtube.com"
+
+system:
+  vram_gb: null             # filled in by preflight from nvidia-smi
+  gpu_name: null
+
+logging:
+  level: INFO               # DEBUG | INFO | WARNING | ERROR
+  file: logs/jarvis.log
+  max_bytes: 5242880
+  backups: 3
+  color: true
