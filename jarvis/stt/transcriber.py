@@ -29,7 +29,7 @@ import numpy as np
 
 __all__ = [
     "Transcript", "Transcriber", "pick_model", "add_cuda_dll_paths",
-    "is_hallucination", "HALLUCINATION_PATTERNS",
+    "is_hallucination", "HALLUCINATION_PATTERNS", "PROTECTED_UTTERANCES",
 ]
 
 logger = logging.getLogger("jarvis.stt.transcriber")
@@ -55,7 +55,7 @@ HALLUCINATION_AVG_LOGPROB = -0.8
 HALLUCINATION_PATTERNS: list[re.Pattern[str]] = [
     # Bracketed sound tags: "[Music]", "(upbeat music)", "[BLANK_AUDIO]", "♪ ♪".
     re.compile(r"[\[\(\*].{0,60}[\]\)\*]"),
-    re.compile(r"[♪♫~\-_.·•]+"),
+    re.compile(r"[♪♫~\-_.·•]+(?:\s+[♪♫~\-_.·•]+)*"),
     # English: the single most common silence hallucination of them all.
     re.compile(r"(thank you|thanks|thank you so much|thanks a lot)"),
     # English YouTube outro credits baked into the training subtitles.
@@ -65,8 +65,9 @@ HALLUCINATION_PATTERNS: list[re.Pattern[str]] = [
     # English subtitle-credit boilerplate ("Subtitles by the Amara.org community").
     re.compile(r"(subtitles?|captions?|transcription|translation)( by| from|:).{0,60}"),
     re.compile(r".{0,40}amara\.org.{0,40}"),
-    # Short English filler whisper emits over room tone.
-    re.compile(r"(you|bye|okay|ok|hello|hi|yeah|yes|no|uh|um|hmm|mm|so|the end|amen|goodbye)"),
+    # Short English filler whisper emits over room tone. Confirmation words are
+    # deliberately absent - see PROTECTED_UTTERANCES.
+    re.compile(r"(you|bye|hello|hi|uh|um|hmm|mm|so|the end|amen|goodbye)"),
     re.compile(r"(bye bye|good bye|okay okay|you know|all right|alright)"),
     # Swedish: the direct counterparts, equally common in Nordic subtitle corpora.
     re.compile(r"tack( så mycket| ska du ha)?"),
@@ -75,11 +76,29 @@ HALLUCINATION_PATTERNS: list[re.Pattern[str]] = [
     # Swedish subtitling credits: "Undertexter av ...", "Textning: ...", "Översättning: ...".
     re.compile(r"(undertexter|undertextning|textning|översättning|svensk text|synk)( av| från|:| ).{0,60}"),
     re.compile(r".{0,40}(btistudios|nordisk undertext|sdi media|iyuno|svt text).{0,40}"),
-    # Swedish short filler and sign-offs.
-    re.compile(r"(hej|hej då|hejdå|ja|nej|jaha|okej|vi ses|ha det bra|god natt|förlåt|precis)"),
+    # Swedish short filler and sign-offs. As above, confirmation words are excluded.
+    re.compile(r"(hej|hej då|hejdå|jaha|vi ses|ha det bra|god natt|förlåt|precis)"),
     re.compile(r"(vi ses i nästa (video|avsnitt)|prenumerera.{0,30})"),
     re.compile(r"(musik|musik spelar|applåder|skratt)"),
 ]
+
+#: Utterances JARVIS must never throw away, however short or however quiet.
+#: These are the spoken answers to a guarded confirmation, and whisper does emit
+#: them over silence - but discarding a real "yes" cancels the action the user just
+#: authorised, which is a far worse failure than acting on a phantom one. Kept in
+#: step with :data:`jarvis.tools.safety.CONFIRM_WORDS` and ``CANCEL_WORDS`` by a
+#: test in tests/test_transcriber.py.
+PROTECTED_UTTERANCES: frozenset[str] = frozenset(
+    {
+        # English
+        "yes", "yeah", "yep", "yup", "ok", "okay", "confirm", "confirmed",
+        "do it", "go ahead", "proceed", "affirmative", "sure",
+        "no", "nope", "cancel", "stop", "abort", "don't",
+        # Swedish
+        "ja", "javisst", "absolut", "okej", "kör", "kör på", "gör det",
+        "nej", "avbryt", "stopp", "sluta",
+    }
+)
 
 _CUDA_DLL_LOCK = threading.Lock()
 _CUDA_DLL_DONE = False
@@ -197,6 +216,9 @@ def is_hallucination(
     normalised = _normalise(text)
     if not normalised:
         return True
+    if normalised in PROTECTED_UTTERANCES:
+        # A guarded action is waiting on this word. Never discard it.
+        return False
     matched = any(pattern.fullmatch(normalised) for pattern in HALLUCINATION_PATTERNS)
     if not matched:
         return False

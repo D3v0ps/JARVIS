@@ -228,6 +228,15 @@ class Config:
 
         try:
             raw_text = resolved.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            # A config saved by an editor in a legacy Windows code page. The bare
+            # UnicodeDecodeError never names the file, so the user cannot tell which
+            # one to fix.
+            logger.error("Config file %s is not valid UTF-8: %s", resolved, exc)
+            raise ValueError(
+                f"Config file {resolved} is not valid UTF-8 ({exc}). "
+                "Re-save it as UTF-8 and try again."
+            ) from exc
         except OSError as exc:
             logger.error("Cannot read config file %s: %s", resolved, exc)
             raise ValueError(f"Cannot read config file {resolved}: {exc}") from exc

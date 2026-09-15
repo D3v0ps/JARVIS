@@ -160,6 +160,18 @@ class Memory:
             except FileNotFoundError:
                 logger.debug("No memory file at %s yet; starting empty.", self._path)
                 return
+            except UnicodeDecodeError as exc:
+                # A file written in a legacy Windows code page. Salvage what we can
+                # rather than refusing to boot over one mis-encoded byte.
+                logger.warning(
+                    "Memory file %s is not valid UTF-8 (%s); reading it leniently.",
+                    self._path, exc,
+                )
+                try:
+                    raw_text = self._path.read_text(encoding="utf-8", errors="replace")
+                except OSError as read_exc:
+                    logger.warning("Could not read memory file %s: %s", self._path, read_exc)
+                    return
             except OSError as exc:
                 logger.warning("Could not read memory file %s: %s", self._path, exc)
                 return

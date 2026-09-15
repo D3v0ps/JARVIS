@@ -1,23 +1,19 @@
 """Speech-synthesis engine protocol, the silent fallback, and engine selection.
 
-Every voice JARVIS can use implements :class:`TTSEngine`: a sample rate, a name, a
-blocking :meth:`~TTSEngine.synthesize` that returns float32 mono audio, an
-:meth:`~TTSEngine.available` probe and a :meth:`~TTSEngine.close`.
-
-:func:`create_engine` builds the engine named in ``tts.engine``, catches every
-construction failure, logs it in a single readable line and falls back through
-``tts.fallback`` and finally to :class:`NullEngine` — the assistant must never die for
-want of a voice.
-
-Nothing heavy is imported here: the concrete engines (and with them ``kokoro_onnx``,
-``piper`` and ``pyttsx3``) are imported inside :func:`_build_engine`, so importing this
-module works on a bare Linux box.
+Every voice implements :class:`TTSEngine`: a sample rate, a name, a blocking
+:meth:`~TTSEngine.synthesize` returning float32 mono audio, :meth:`~TTSEngine.available`
+and :meth:`~TTSEngine.close`. :func:`create_engine` builds the engine named in
+``tts.engine``, catches every construction failure, logs it in one readable line and falls
+back through ``tts.fallback`` and finally to :class:`NullEngine` — the assistant must never
+die for want of a voice. The concrete engines (and with them ``kokoro_onnx``, ``piper`` and
+``pyttsx3``) are imported inside :func:`_build_engine`, so this module imports anywhere.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import wave
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Protocol, runtime_checkable
 
@@ -35,13 +31,14 @@ __all__ = [
     "peak_limit",
     "to_float32_mono",
     "silence",
+    "read_wav_file",
     "KNOWN_ENGINES",
     "DEFAULT_SAMPLE_RATE",
     "NULL_SILENCE_S",
 ]
 
 logger = logging.getLogger("jarvis.tts.engine")
-#: Module logger under its own name, since the public functions take a ``logger`` argument.
+#: Alias: the public functions take a ``logger`` argument that shadows the module one.
 _LOG = logger
 
 #: Kokoro's native rate, and the rate the silent engine reports.
@@ -77,7 +74,6 @@ class TTSEngine(Protocol):
         """Release models, handles and temporary files. Safe to call twice."""
         ...
 
-
 # --- shared audio helpers -------------------------------------------------------------
 def to_float32_mono(audio: Any) -> np.ndarray:
     """Convert int16/int32/uint8/float audio, mono or ``(n, channels)``, to float32 mono."""
@@ -97,18 +93,41 @@ def to_float32_mono(audio: Any) -> np.ndarray:
 def peak_limit(audio: Any, peak: float = 1.0) -> np.ndarray:
     """Return float32 mono audio scaled so its loudest sample is at most ``peak``.
 
-    Non-finite samples become silence rather than a speaker-destroying click, and the
-    result is clipped as a final guarantee — every engine returns audio through here.
+    Non-finite samples become silence rather than a click, and the result is clipped as a
+    final guarantee — every engine returns its audio through here.
     """
     data = to_float32_mono(audio)
-    ceiling = float(peak) if peak > 0.0 else 1.0
     if data.size == 0:
         return data
+    ceiling = float(peak) if peak > 0.0 else 1.0
     data = np.nan_to_num(data, nan=0.0, posinf=ceiling, neginf=-ceiling)
     loudest = float(np.max(np.abs(data)))
     if loudest > ceiling:
         data = data * np.float32(ceiling / loudest)
     return np.clip(data, -ceiling, ceiling).astype(np.float32)
+
+
+def read_wav_file(path: str | Path) -> tuple[np.ndarray, int] | None:
+    """Read a PCM wav file into ``(float32 mono, sample_rate)`` with the standard library.
+
+    Used by the engines that can only produce a file (Piper's executable, pyttsx3), which
+    is why JARVIS needs no ``soundfile`` dependency. Returns ``None`` for an empty file.
+    """
+    with wave.open(str(path), "rb") as handle:
+        channels = handle.getnchannels()
+        width = handle.getsampwidth()
+        rate = handle.getframerate()
+        frames = handle.readframes(handle.getnframes())
+    if not frames:
+        return None
+    dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(width)
+    if dtype is None:
+        raise ValueError(f"Unsupported wav sample width: {width} bytes")
+    data = np.frombuffer(frames, dtype=dtype)
+    if channels > 1:
+        usable = (data.size // channels) * channels
+        data = data[:usable].reshape(-1, channels)
+    return to_float32_mono(data), int(rate)
 
 
 def silence(seconds: float, sample_rate: int) -> np.ndarray:
@@ -120,23 +139,15 @@ def silence(seconds: float, sample_rate: int) -> np.ndarray:
 class NullEngine:
     """The voice of last resort: it logs once and returns silence.
 
-    Returning ``NULL_SILENCE_S`` of silence instead of an empty array keeps the
-    pipeline's timing intact — the player still "plays" a clip, the state bus still
-    passes through SPEAKING, and the latency tracker still sees a first-audio moment.
-
-    :meth:`available` deliberately returns ``True``: this engine always works, it simply
-    has nothing to say. A caller that wants to know whether a real voice was found can
-    compare ``engine.name`` with ``"null"`` or read :attr:`reason`.
+    Returning ``NULL_SILENCE_S`` of silence rather than an empty array keeps the pipeline's
+    timing intact — the player still plays a clip, the state bus still passes through
+    SPEAKING and the latency tracker still sees a first-audio moment. :meth:`available` is
+    deliberately ``True``: this engine always works, it simply has nothing to say; compare
+    ``engine.name`` with ``"null"`` or read :attr:`reason` to detect it.
     """
 
-    def __init__(
-        self,
-        logger: logging.Logger | None = None,
-        *,
-        sample_rate: int = DEFAULT_SAMPLE_RATE,
-        silence_s: float = NULL_SILENCE_S,
-        reason: str = "",
-    ) -> None:
+    def __init__(self, logger: logging.Logger | None = None, *, sample_rate: int = DEFAULT_SAMPLE_RATE,
+                 silence_s: float = NULL_SILENCE_S, reason: str = "") -> None:
         self.name = "null"
         self.sample_rate = int(sample_rate) if int(sample_rate) > 0 else DEFAULT_SAMPLE_RATE
         self.silence_s = float(silence_s)
@@ -172,7 +183,6 @@ class NullEngine:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"NullEngine(sample_rate={self.sample_rate}, reason={self.reason!r})"
 
-
 # --- configuration helpers ------------------------------------------------------------
 def _cfg_get(cfg: "Config | None", dotted: str, default: Any) -> Any:
     """Read a dotted key from a :class:`~jarvis.config.Config` (or anything with ``get``)."""
@@ -194,7 +204,7 @@ def _resolve_path(cfg: "Config | None", dotted: str, default: str) -> Path:
         try:
             return Path(resolver(raw))
         except Exception:
-            logger.debug("Config.resolve_path failed for %r", raw, exc_info=True)
+            _LOG.debug("Config.resolve_path failed for %r", raw, exc_info=True)
     candidate = Path(raw).expanduser()
     if candidate.is_absolute():
         return candidate
@@ -219,25 +229,17 @@ def _as_name_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [part.strip().lower() for part in value.replace(";", ",").split(",") if part.strip()]
     if isinstance(value, Iterable):
-        names: list[str] = []
-        for item in value:
-            if item is None:
-                continue
-            text = str(item).strip().lower()
-            if text:
-                names.append(text)
-        return names
+        return [str(item).strip().lower() for item in value if item is not None and str(item).strip()]
     return [str(value).strip().lower()]
 
 
 def _candidate_names(cfg: "Config | None", language: str | None, log: logging.Logger) -> list[str]:
     """Engine names to try, in order, for ``language``.
 
-    The language rule lives here: when the resolved language is Swedish and the Piper
-    Swedish model is actually installed, Piper goes first even though ``tts.engine`` says
-    ``kokoro`` — Kokoro has no Swedish voice, so the British one would read Swedish text
-    with an English phoniser. When the model is missing we stay with the configured
-    engine rather than falling silent.
+    The language rule lives here: when the resolved language is Swedish and the Piper model
+    is actually installed, Piper goes first even though ``tts.engine`` says ``kokoro`` —
+    Kokoro has no Swedish voice and would read Swedish with an English phoniser. With the
+    model missing we stay on the configured engine rather than falling silent.
     """
     primary = str(_cfg_get(cfg, "tts.engine", "kokoro")).strip().lower() or "kokoro"
     names: list[str] = []
@@ -265,7 +267,6 @@ def _candidate_names(cfg: "Config | None", language: str | None, log: logging.Lo
             continue
         ordered.append(name)
     return ordered
-
 
 # --- construction ---------------------------------------------------------------------
 def _build_engine(name: str, cfg: "Config | None", log: logging.Logger) -> TTSEngine | None:
@@ -316,7 +317,6 @@ def _build_engine(name: str, cfg: "Config | None", log: logging.Logger) -> TTSEn
     except Exception:  # pragma: no cover - defensive
         log.debug("Closing the unusable '%s' engine failed.", name, exc_info=True)
     return None
-
 
 # --- engine cache ---------------------------------------------------------------------
 # The Speaker calls select_engine_for_language() per utterance, so built engines are

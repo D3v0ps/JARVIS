@@ -47,6 +47,11 @@ _SPEECH_MARGIN_DB = 10.0
 #: Weight of each new quiet frame in the slow re-calibration of the noise floor.
 _FLOOR_ADAPT = 0.02
 
+#: How much of the closing silence stays on the end of an utterance. Enough that a
+#: trailing consonant survives, little enough that whisper is not asked to transcribe
+#: nothing. The rest of the ``silence_ms`` hang-over is trimmed in ``_finish``.
+TRAILING_SILENCE_MS = 200
+
 _EPS = 1e-7
 
 
@@ -126,12 +131,28 @@ class _BaseSegmenter:
         self._pre_roll = buffer[-keep:] if buffer.size > keep else buffer
 
     def _finish(self) -> np.ndarray:
-        """Assemble the utterance, reset, and hand it to the caller."""
+        """Assemble the utterance, trim the hang-over, reset, and hand it over.
+
+        The utterance ended because ``silence_ms`` of quiet went by, and all of that
+        quiet is sitting at the end of the buffer. Handing it to whisper costs real
+        latency on every turn and is precisely the condition that provokes its
+        "Thank you." hallucination, so only a short tail is kept - enough that a
+        trailing consonant is not clipped.
+        """
         parts = self._utterance
         audio = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+        trailing = int(self._silence_samples)
+        keep_tail = int(self.sample_rate * TRAILING_SILENCE_MS / 1000)
+        if trailing > keep_tail:
+            trimmed = audio.size - (trailing - keep_tail)
+            if trimmed > 0:
+                audio = audio[:trimmed]
         self._reset_state()
         self.log.debug(
-            "Utterance captured: %.2f s (%d samples).", audio.size / self.sample_rate, audio.size
+            "Utterance captured: %.2f s (%d samples), %d ms of hang-over trimmed.",
+            audio.size / self.sample_rate,
+            audio.size,
+            max(0, (trailing - keep_tail)) * 1000 // self.sample_rate,
         )
         return audio.astype(np.float32, copy=False)
 

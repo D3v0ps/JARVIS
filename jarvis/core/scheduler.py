@@ -335,7 +335,11 @@ _REPLACEMENTS: Final[tuple[tuple[str, str], ...]] = (
 def _normalise(text: str) -> str:
     """Lower-case, de-clutter and unify the spellings the parsers expect."""
     clean = unicodedata.normalize("NFKC", text or "").lower().strip()
-    clean = clean.replace("!", " ").replace("?", " ").replace(",", " ")
+    clean = clean.replace("!", " ").replace("?", " ")
+    # A comma between digits is a Swedish decimal point ("om 1,5 timmar"); anywhere
+    # else it is punctuation and becomes a space.
+    clean = re.sub(r"(?<=\d),(?=\d)", ".", clean)
+    clean = clean.replace(",", " ")
     for pattern, repl in _REPLACEMENTS:
         clean = re.sub(pattern, repl, clean)
     return re.sub(r"\s+", " ", clean).strip()

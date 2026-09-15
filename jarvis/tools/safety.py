@@ -108,7 +108,12 @@ BLOCKLIST_PATTERNS: list[tuple[str, str]] = [
 
     # --- Deleting Windows itself -----------------------------------------------------
     # Any delete alias aimed at C:\Windows (which covers C:\Windows\System32).
-    (rf"\b{_DEL}\b[^\n]*[a-z]:\\+windows\b", "deleting files inside the Windows directory"),
+    # The trailing separator matters: without it the \b matches before a hyphen and
+    # an ordinary folder such as D:\windows-backup is refused as if it were C:\Windows.
+    (
+        rf"\b{_DEL}\b[^\n]*[a-z]:\\+windows(?:\\|\s|\"|'|$)",
+        "deleting files inside the Windows directory",
+    ),
     # ... or at System32 written relative / via %SystemRoot% / $env:windir.
     (rf"\b{_DEL}\b[^\n]*\bsystem32\b", "deleting files inside System32"),
     # ... or at a whole drive: "del C:\*", "Remove-Item D:\ -Recurse".

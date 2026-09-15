@@ -196,6 +196,9 @@ _NUMBER_RE = re.compile(r"^\s*\d{1,3}[.)]\s+")
 _RULE_RE = re.compile(r"^\s*(?:[-*_])(?:\s*[-*_]){2,}\s*$")
 _TABLE_RULE_RE = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]*$")
 _BOLD_ITALIC_RE = re.compile(r"\*{1,3}(\S(?:[^*]*\S)?)\*{1,3}")
+#: Underscore emphasis (_italic_, __bold__). The inner group must not be allowed
+#: to swallow the closing underscores, or "__bold__" leaves one behind.
+_UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![A-Za-z0-9_])_{1,3}([^_\n]+?)_{1,3}(?![A-Za-z0-9_])")
 _STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
 _UNDERSCORE_RE = re.compile(r"(?<![\w\\])_{1,3}(\S(?:[^_]*\S)?)_{1,3}(?![\w])")
 _EMOJI_RE = re.compile(
@@ -267,6 +270,7 @@ def clean_for_speech(text: str) -> str:
     cleaned = _strip_line_markers(cleaned)
     cleaned = _STRIKE_RE.sub(r"\1", cleaned)
     cleaned = _BOLD_ITALIC_RE.sub(r"\1", cleaned)
+    cleaned = _UNDERSCORE_EMPHASIS_RE.sub(r"\1", cleaned)
     cleaned = _UNDERSCORE_RE.sub(r"\1", cleaned)
     cleaned = cleaned.replace("*", "").replace("`", "")
     cleaned = _EMOJI_RE.sub(" ", cleaned)

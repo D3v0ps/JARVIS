@@ -149,6 +149,8 @@ class KokoroTTS:
         self.voice = str(voice or "bm_george")
         self.speed = float(speed) if speed and float(speed) > 0 else 1.0
         self.lang = str(lang or DEFAULT_LANG)
+        #: Spoken language, read by the Speaker when it decides whether to switch voices.
+        self.language = self.lang.split("-")[0].lower() or "en"
         self.log = logger if logger is not None else _LOG
 
         self.model_path = _resolve(model_path, "models/kokoro-v1.0.onnx")
