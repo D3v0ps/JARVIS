@@ -166,10 +166,15 @@ Check the machine at any time:
 
 ### Start it your way
 
+Everything you need is a double-click. No terminal, ever.
+
 | Double-click | What it does |
 |---|---|
 | **JARVIS.exe** | brings him online — this is the one you want |
 | **Install-JARVIS.exe** | installs or repairs everything |
+| **Check-JARVIS.bat** | reports what is installed and what is missing |
+| **Test-Overlay.bat** | shows the arc reactor cycling through every state |
+| **Test-Voice.bat** | speaks one line, so you know the voice works |
 
 | Command | What it does |
 |---|---|
