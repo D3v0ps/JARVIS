@@ -311,7 +311,7 @@ class Assistant:
             self.log.debug("Nothing intelligible in %.1f s of audio.", transcript.duration_s)
             return
 
-        log_transcript("user", text)
+        # Brain.turn logs the user line itself; logging it here too printed it twice.
         if self._hud is not None:
             self._hud.begin_turn(text)
             self._hud.state = AssistantState.THINKING
