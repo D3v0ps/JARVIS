@@ -12,6 +12,8 @@
  */
 
 #include "launcher_common.h"
+#include <stdio.h>
+#include <wchar.h>
 
 #define MAX_LONG_PATH 4096
 
@@ -77,6 +79,19 @@ int wmain(int argc, wchar_t **argv)
     if (code == -1) {
         jarvis_message(L"JARVIS", L"Windows would not let me start PowerShell.", MB_ICONERROR);
         return 1;
+    }
+
+    /* This console belongs to us, so returning closes it. If the installer failed,
+     * hold the window open - a window that vanishes tells the user nothing, which
+     * is exactly the failure this program exists to avoid. */
+    if (code != 0) {
+        wchar_t log[MAX_LONG_PATH];
+        if (jarvis_join(log, MAX_LONG_PATH, dir, L"logs\\install.log")) {
+            wprintf(L"\n  The installation did not finish (code %d).\n", code);
+            wprintf(L"  What happened is written in:\n  %ls\n\n", log);
+        }
+        wprintf(L"  Press Enter to close this window.\n");
+        (void)getwchar();
     }
     return code;
 }

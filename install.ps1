@@ -62,6 +62,27 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $script:StepNumber = 0
 $script:Warnings = New-Object System.Collections.Generic.List[string]
 
+# A terminating error anywhere used to close this window instantly, which told the
+# user nothing at all. Catch everything, show it, log it, and wait.
+trap {
+    Write-Host ""
+    Write-Host "  -----------------------------------------------------------" -ForegroundColor Red
+    Write-Host "  Something went wrong and the installation stopped." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.InvocationInfo) {
+        Write-Host "  line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "  The full log is in $LogFile" -ForegroundColor Yellow
+    Write-Host "  Send that file along and it can be fixed." -ForegroundColor Yellow
+    Write-Host "  -----------------------------------------------------------" -ForegroundColor Red
+    try { Add-Content -Path $LogFile -Value ("UNHANDLED: " + ($_ | Out-String)) -Encoding utf8 } catch {}
+    Write-Host ""
+    Read-Host "  Press Enter to close"
+    exit 1
+}
+
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $line = "{0} {1,-5} {2}" -f (Get-Date -Format "HH:mm:ss"), $Level, $Message
@@ -139,15 +160,40 @@ function Test-Command {
 }
 
 function Invoke-Native {
-    <# Run an executable, stream its output to the log, and return the exit code. #>
-    param([string]$File, [string[]]$Arguments, [switch]$Quiet)
+    <# Run an executable and return its exit code.
+
+       -Passthrough lets the program write straight to this console, which is what
+       you want for anything with a progress bar.
+
+       The ErrorActionPreference dance is not decoration. In Windows PowerShell 5.1
+       a native command's stderr, captured with 2>&1, arrives as ErrorRecord objects,
+       and with $ErrorActionPreference = 'Stop' the first one is a TERMINATING error.
+       'ollama pull' writes its progress bar to stderr, so the installer used to die
+       the instant the model download began - and the window closed before anyone
+       could read why. #>
+    param([string]$File, [string[]]$Arguments, [switch]$Quiet, [switch]$Passthrough)
     Write-Log "run: $File $($Arguments -join ' ')"
-    if ($Quiet) {
-        & $File @Arguments 2>&1 | ForEach-Object { Write-Log "    $_" }
-    } else {
-        & $File @Arguments 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray; Write-Log "    $_" }
+
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($Passthrough) {
+            & $File @Arguments
+        } elseif ($Quiet) {
+            & $File @Arguments 2>&1 | ForEach-Object { Write-Log "    $_" }
+        } else {
+            & $File @Arguments 2>&1 | ForEach-Object {
+                Write-Host "      $_" -ForegroundColor DarkGray
+                Write-Log "    $_"
+            }
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
     }
-    return $LASTEXITCODE
+    if ($null -eq $code) { $code = 0 }
+    Write-Log "exit code $code"
+    return $code
 }
 
 function Install-WithWinget {
@@ -332,7 +378,16 @@ Say $choice.Reason
 
 Step "Ollama"
 if (Test-Command "ollama") {
-    Ok "Ollama is already installed ($((& ollama --version 2>&1) -join ' '))"
+    # `ollama --version` also prints a warning when the service is not up yet, and
+    # that warning arrives on stderr - so capture it with the preference relaxed and
+    # keep only the line that actually carries the version.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $versionLines = @(& ollama --version 2>&1 | ForEach-Object { "$_" }) }
+    finally { $ErrorActionPreference = $previousPreference }
+    $version = $versionLines | Where-Object { $_ -match "version" } | Select-Object -First 1
+    if (-not $version) { $version = "installed" }
+    Ok "Ollama is already installed ($($version.Trim()))"
 } else {
     Install-WithWinget "Ollama.Ollama" "Ollama"
     if (-not (Test-Command "ollama")) {
@@ -370,16 +425,18 @@ else { Abort "The Ollama service never answered on http://127.0.0.1:11434." "Try
 # --------------------------------------------------------------------------- #
 
 Step "Language model ($chosenModel)"
-$installed = (& ollama list 2>&1) -join "`n"
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try { $installed = (& ollama list 2>&1 | Out-String) } finally { $ErrorActionPreference = $previousPreference }
 if ($installed -match [regex]::Escape($chosenModel)) {
     Ok "$chosenModel is already pulled"
 } else {
     Say "Pulling $chosenModel - this is the big one, several gigabytes. Time for a coffee."
-    $code = Invoke-Native "ollama" @("pull", $chosenModel)
+    $code = Invoke-Native "ollama" @("pull", $chosenModel) -Passthrough
     if ($code -ne 0) {
         Warn "Pulling $chosenModel failed. Falling back to qwen3:8b."
         $chosenModel = "qwen3:8b"
-        $code = Invoke-Native "ollama" @("pull", $chosenModel)
+        $code = Invoke-Native "ollama" @("pull", $chosenModel) -Passthrough
         if ($code -ne 0) { Abort "Could not pull a language model." "Check your internet connection and run 'ollama pull qwen3:8b' by hand." }
     }
     Ok "$chosenModel is ready"
@@ -401,7 +458,7 @@ if (Test-Path $VenvPy) {
 
 Say "Installing dependencies - the first run takes a few minutes..."
 Invoke-Native $VenvPy @("-m", "pip", "install", "--upgrade", "pip", "--quiet") -Quiet | Out-Null
-$code = Invoke-Native $VenvPy @("-m", "pip", "install", "-r", (Join-Path $Root "requirements.txt"))
+$code = Invoke-Native $VenvPy @("-m", "pip", "install", "-r", (Join-Path $Root "requirements.txt")) -Passthrough
 if ($code -ne 0) {
     Abort "Dependency installation failed." "The last lines of $LogFile say why."
 }
@@ -415,7 +472,7 @@ if (-not $SkipModels) {
     Step "Voice and wake word"
     $fetchArgs = @((Join-Path $Root "scripts\fetch_models.py"))
     if ($Swedish) { $fetchArgs += "--swedish" }
-    $code = Invoke-Native $VenvPy $fetchArgs
+    $code = Invoke-Native $VenvPy $fetchArgs -Passthrough
     if ($code -ne 0) { Warn "Some model files did not download. JARVIS will fall back to the Windows voice until you run scripts\fetch_models.py again." }
     else { Ok "Kokoro voice and wake word models are in place" }
 }
