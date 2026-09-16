@@ -176,6 +176,8 @@ Everything you need is a double-click. No terminal, ever.
 | **Test-Overlay.bat** | shows the arc reactor cycling through every state |
 | **Test-Voice.bat** | speaks one line, so you know the voice works |
 | **Get-Voice.bat** | downloads the British Kokoro voice and the wake-word models |
+| **Enable-Phone.bat** | lets your phone reach him from anywhere — see [the phone](#2b-the-phone) |
+| **Disable-Phone.bat** | takes that down again |
 
 | Command | What it does |
 |---|---|
@@ -192,6 +194,51 @@ Everything you need is a double-click. No terminal, ever.
 To uninstall: delete the folder, then `winget uninstall Ollama.Ollama` if you want the
 model gone too. JARVIS writes nothing outside his own folder except the two shortcuts and,
 if you asked for it, the logon task (`scripts\uninstall-autostart.ps1` removes that).
+
+---
+
+## 2b. The phone
+
+JARVIS is also an app on your phone: the same ring, the same voice, the same tools,
+and it works from anywhere — the café, the car, the other side of the world — as long
+as the PC at home is awake. There is nothing to download from an app store and
+nothing in the cloud: the phone talks straight to your PC over
+[Tailscale](https://tailscale.com), a private tunnel between devices you own.
+
+> ### 1. On the PC, double-click **`Enable-Phone.bat`**.
+> It installs Tailscale if you do not have it, signs you in (a browser opens — use any
+> Google, Microsoft, Apple or GitHub login), turns the phone door on in `config.yaml`
+> and asks Tailscale for an HTTPS address for this machine. It ends by printing that
+> address and a QR code.
+> ### 2. On the phone, install the **Tailscale** app and sign in with the same account.
+> ### 3. Scan the QR code, or type the address into Safari or Chrome.
+> ### 4. **Share → Add to Home Screen.** Now it is an app, with an icon, full screen.
+> ### 5. Start JARVIS on the PC. He prints a six-digit pairing code — type it into the phone once.
+
+That is the whole procedure. The phone stays paired for thirty days at a time.
+
+**What the app looks like.** The arc reactor is the button: tap it and speak, tap again
+to stop. Under it, what he heard and what he said, and a card for everything he did —
+a business he found comes with a **Call** button, a timer counts down, the weather
+shows the numbers. Along the top: the PC's CPU, RAM, GPU temperature and the next timer,
+live. At the bottom a text field, for the places where you cannot talk, and your
+routines as buttons.
+
+**What the phone may do.** Everything the desk can, with one exception: the guarded
+tools — PowerShell, deleting files, shutting down — are *refused* from the phone,
+because a spoken "confirm" is worth little when the microphone is out in the world.
+`remote.allow_guarded: true` lifts that if you really want it. Typing into the PC is
+never allowed from the phone.
+
+**When it does not connect.** The PC must be on and JARVIS running; sleep mode ends the
+call. Both devices must be signed in to Tailscale — the app shows a green *Connected*.
+If Enable-Phone.bat says your tailnet has HTTPS switched off, it gives you the link:
+one button in the Tailscale admin console, then run it again. `Enable-Phone.bat` is
+safe to run any number of times; `Disable-Phone.bat` closes the door.
+
+**Without Tailscale.** On your own Wi-Fi you can set `remote.host` to the PC's LAN
+address instead, but a phone browser only opens the microphone on an HTTPS page, so
+that path is typing only. Tailscale is the one that gives you the voice.
 
 ---
 
@@ -332,6 +379,12 @@ Refusals are logged.
 | `tools.default_city` | `Stockholm` | for `weather` with no city |
 | `tools.powershell_timeout` | `30` | seconds |
 | `tools.apps` | see file | the `open_app` allowlist — add your own |
+| `remote.enabled` | `false` | listen for the phone; `Enable-Phone.bat` sets it |
+| `remote.host` / `remote.port` | `127.0.0.1` / `8765` | this machine only; Tailscale is the door. Never `0.0.0.0` |
+| `remote.url` | `""` | the HTTPS address the phone opens; written by `Enable-Phone.bat` |
+| `remote.allow_guarded` | `false` | let the phone run guarded tools after a spoken confirm |
+| `remote.speak_locally` | `false` | also say phone replies out of the desk speakers |
+| `remote.routines` | `[]` | named macros shown as buttons on the phone |
 | `logging.level` | `INFO` | `DEBUG` shows every frame decision |
 
 ---

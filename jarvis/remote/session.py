@@ -374,12 +374,16 @@ class RemoteTurn:
     reports back through :meth:`finish`.
     """
 
-    audio: np.ndarray
+    audio: np.ndarray | None
     sample_rate: int = 16000
     device: str = "phone"
+    #: A typed turn: no audio, nothing to transcribe. For the bus, or a quiet room.
+    text: str = ""
     on_sentence: Callable[[str], None] = lambda sentence: None
     on_transcript: Callable[[str], None] | None = None
     on_done: Callable[[str, str], None] | None = None
+    #: Each tool the brain ran during this turn, so the phone can draw a card for it.
+    on_tool: Callable[[dict], None] | None = None
     #: Wraps the brain's dispatcher for the duration of this turn (see RemoteGuard).
     wrap_dispatcher: Callable[[Any], Any] | None = None
     #: False keeps the reply on the phone only; the desk stays quiet.
@@ -389,7 +393,20 @@ class RemoteTurn:
     @property
     def duration_s(self) -> float:
         rate = float(self.sample_rate or 16000)
-        return float(getattr(self.audio, "size", 0)) / rate if rate > 0 else 0.0
+        return float(getattr(self.audio, "size", 0) or 0) / rate if rate > 0 else 0.0
+
+    def send(self, sentence: str) -> None:
+        """Stream one finished sentence to the phone. Never raises into the worker."""
+        _safely(self.on_sentence, sentence)
+
+    def tool_event(self, event: dict) -> None:
+        """Report one tool call. Never raises into the worker."""
+        if self.on_tool is None:
+            return
+        try:
+            self.on_tool(event)
+        except Exception:  # noqa: BLE001
+            _log.debug("Remote tool callback failed.", exc_info=True)
 
     def transcribed(self, text: str) -> None:
         """Report the recognised text. Never raises into the worker thread."""
@@ -413,6 +430,78 @@ def _safely(callback: Callable[[str], None] | None, text: str) -> None:
         callback(text)
     except Exception:  # noqa: BLE001
         _log.debug("Remote turn callback failed.", exc_info=True)
+
+
+# ----------------------------------------------------------------------------------
+# Telling the phone what happened
+# ----------------------------------------------------------------------------------
+class ToolReporter:
+    """Dispatcher wrapper that reports every call, so the phone can draw a card.
+
+    Sits *outside* the guard: a refusal is reported too, which is exactly what the
+    user needs to see when something was not allowed from the phone.
+    """
+
+    #: Only these keys of a result's ``data`` travel to the phone. Everything else
+    #: - file paths, raw PowerShell output - stays in the log where it belongs.
+    SAFE_DATA_KEYS = frozenset({
+        # places and calls
+        "name", "phone", "spoken_phone", "website", "address", "opening_hours", "places",
+        # timers and reminders (``due`` is an epoch the phone counts down from)
+        "minutes", "label", "due", "when", "text", "id", "kind", "jobs", "cancelled",
+        # the clock
+        "time", "weekday", "date",
+        # weather
+        "city", "country", "temperature_c", "apparent_c", "condition", "high_c", "low_c",
+        "wind_ms", "humidity_pct",
+        # the machine
+        "cpu_percent", "ram_used_gb", "ram_total_gb", "disk_free_gb", "uptime_s",
+        "gpu_percent", "gpu_temperature_c", "vram_used_mb", "vram_total_mb",
+        # apps, search and the web
+        "app", "count", "results", "query", "source", "title", "url",
+    })
+
+    def __init__(self, inner: Any, report: Callable[[dict], None]) -> None:
+        self._inner = inner
+        self._report = report
+
+    def execute(self, name: str, args: dict) -> Any:
+        started = time.monotonic()
+        result = self._inner.execute(name, args)
+        data = getattr(result, "data", None)
+        clean = None
+        if isinstance(data, dict):
+            clean = {k: v for k, v in data.items()
+                     if k in self.SAFE_DATA_KEYS and isinstance(v, (str, int, float, bool, list))}
+        try:
+            self._report({
+                "type": "tool",
+                "name": str(name),
+                "ok": bool(getattr(result, "ok", False)),
+                "refused": bool(getattr(result, "refused", False)),
+                "summary": str(getattr(result, "summary", "") or ""),
+                "data": clean,
+                "ms": round((time.monotonic() - started) * 1000),
+            })
+        except Exception:  # noqa: BLE001 - reporting must never break the turn
+            _log.debug("Tool report failed.", exc_info=True)
+        return result
+
+    def execute_many(self, calls: Any) -> list[Any]:
+        results = []
+        for call in calls or []:
+            name = getattr(call, "name", None)
+            args = getattr(call, "arguments", None)
+            if name is None and isinstance(call, dict):
+                name, args = call.get("name", ""), call.get("arguments", {})
+            results.append(self.execute(str(name or ""), args or {}))
+        return results
+
+    def tools_payload(self) -> list[dict]:
+        return self._inner.tools_payload()
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
 
 
 # ----------------------------------------------------------------------------------

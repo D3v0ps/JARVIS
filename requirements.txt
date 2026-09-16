@@ -40,6 +40,7 @@ pystray>=0.19.5          # tray icon (tkinter ships with Python)
 flask>=3.0
 flask-sock>=0.7
 waitress>=3.0
+qrcode>=7.4              # Enable-Phone.bat draws the address as a QR code to scan
 
 # --- GPU acceleration for faster-whisper (harmless on CPU-only machines) ---
 nvidia-cublas-cu12       ; sys_platform == "win32"

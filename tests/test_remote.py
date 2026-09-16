@@ -635,8 +635,12 @@ def test_the_turn_hands_the_worker_a_guard_for_its_dispatcher(server, assistant)
     with _in_request(server, app, cookie=_token(server)):
         server.audio_socket(FakeSocket([_pcm(0.2)]))
 
-    assert isinstance(assistant.wrapped[0], RemoteGuard)
-    assert assistant.wrapped[0].allow_guarded is False
+    # The reporter that narrates tool calls to the phone sits outside the guard, so
+    # a refusal is reported too. The guard must still be there, underneath.
+    wrapped = assistant.wrapped[0]
+    guard = getattr(wrapped, "_inner", wrapped)
+    assert isinstance(guard, RemoteGuard)
+    assert guard.allow_guarded is False
 
 
 def test_sentences_stream_in_order_from_the_worker_thread(remote_config):

@@ -158,3 +158,51 @@ def test_stop_is_idempotent(assistant):
     assistant.start()
     assistant.stop()
     assistant.stop()
+
+
+def test_a_remote_turn_runs_under_the_phone_guard(assistant, monkeypatch):
+    """The guard travels with the turn and must actually be installed.
+
+    It was not: the assistant read turn.text and turn.audio but never called
+    turn.wrap_dispatcher, so a phone got the desk's rules. type_text is announced,
+    not guarded, so it would have typed blind into whatever window was focused.
+    """
+    from types import SimpleNamespace
+
+    seen: list = []
+
+    class Wrapped:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, name, args):
+            seen.append(name)
+            return self.inner.execute(name, args)
+
+        def tools_payload(self):
+            return self.inner.tools_payload()
+
+        def __getattr__(self, item):
+            return getattr(self.inner, item)
+
+    used: list = []
+
+    def fake_turn(text, on_sentence, should_stop):
+        used.append(type(assistant.parts.brain.dispatcher).__name__)
+        on_sentence("Done, sir.")
+        return SimpleNamespace(reply="Done, sir.", error="", cancelled=False, tool_calls=[])
+
+    monkeypatch.setattr(assistant.parts.brain, "turn", fake_turn)
+    before = assistant.parts.brain.dispatcher
+
+    finished: list = []
+    turn = SimpleNamespace(
+        text="what time is it", audio=None, device="test-phone",
+        wrap_dispatcher=lambda inner: Wrapped(inner),
+        send=lambda s: None, finish=lambda reply, error="": finished.append((reply, error)),
+    )
+    assistant._handle_remote_turn(turn)
+
+    assert used == ["Wrapped"], "the brain must run under the phone's guard"
+    assert assistant.parts.brain.dispatcher is before, "and be restored afterwards"
+    assert finished and finished[0][0] == "Done, sir."

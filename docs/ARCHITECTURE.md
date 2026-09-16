@@ -787,7 +787,13 @@ desk. A second socket carries `StateBus` changes so the page shows the same stat
 
 Security, because this thing runs PowerShell:
 * `remote.enabled: false` by default. An installer must never open a socket.
-* Bind to the Tailscale interface address, never `0.0.0.0`.
+* Bind to loopback and let **Tailscale Serve** be the only door
+  (`scripts/enable_phone.py`, run by `Enable-Phone.bat`: `tailscale serve --bg
+  --https=443 http://127.0.0.1:8765`). Serve terminates TLS with a certificate for
+  `<machine>.<tailnet>.ts.net`, reachable only from the tailnet - and HTTPS is what
+  makes a phone browser hand over the microphone at all. The address is recorded in
+  `remote.url` so the console banner and the phone agree. Binding the Tailscale IP
+  directly is the HTTP fallback; never `0.0.0.0`.
 * `safety.remote_tier()`: GUARDED tools are **refused** over the phone unless
   `remote.allow_guarded` is true - spoken confirmation is a weak control when the
   attacker holds the microphone. The blocklist is unchanged.

@@ -113,8 +113,9 @@ tools:
 
 remote:                     # talking to JARVIS from your phone
   enabled: false            # an installer must never open a socket
-  host: 127.0.0.1           # the Tailscale address on the real machine, never 0.0.0.0
+  host: 127.0.0.1           # this machine only; Tailscale's HTTPS door is the way in. Never 0.0.0.0
   port: 8765
+  url: ""                   # what the phone opens, written by Enable-Phone.bat
   allow_guarded: false      # guarded tools are refused from the phone by default
   speak_locally: false      # answer on the phone, not out of the desk speakers
   routines: []              # named macros shown as buttons

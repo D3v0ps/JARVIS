@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from jarvis.core.logging import get_logger
 from jarvis.remote.session import (
+    ToolReporter,
     COOKIE_NAME,
     Device,
     RemoteGuard,
@@ -48,6 +49,7 @@ DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "host": "127.0.0.1",
     "port": 8765,
+    "url": "",
     "allow_guarded": False,
     "secret_file": "logs/remote-secret.key",
     "session_ttl_hours": 720,
@@ -140,11 +142,17 @@ class RemoteServer:
 
     @property
     def url(self) -> str:
-        """Where the phone should point its browser."""
+        """Where this server actually listens."""
         host = self.host or "127.0.0.1"
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
         return f"http://{host}:{self._bound_port}"
+
+    @property
+    def phone_url(self) -> str:
+        """What the phone opens: the HTTPS door Enable-Phone.bat set up, else :attr:`url`."""
+        public = str(_cfg(self.cfg, "url") or "").strip()
+        return public or self.url
 
     @property
     def pairing_code(self) -> str:
@@ -260,6 +268,7 @@ class RemoteServer:
         """Print the pairing code where the operator can see it — console only."""
         banner = (
             f"\n  JARVIS remote is up at {self.url}\n"
+            f"  Open on the phone: {self.phone_url}\n"
             f"  Pairing code: {self.sessions.pairing_code}\n"
         )
         self.log.info("Remote access listening on %s.", self.url)
@@ -342,6 +351,13 @@ class RemoteServer:
             response.delete_cookie(COOKIE_NAME, path="/")
             return response
 
+        @app.get("/api/status")
+        def api_status() -> Any:
+            device = self.device_for(request.cookies.get(COOKIE_NAME))
+            if device is None:
+                return jsonify({"error": "Pair this phone first."}), 401
+            return jsonify(self.status_snapshot())
+
         @app.post("/api/routine")
         def routine() -> Any:
             device = self.device_for(request.cookies.get(COOKIE_NAME))
@@ -366,6 +382,45 @@ class RemoteServer:
     def device_for(self, token: str | None) -> Device | None:
         """The paired device a cookie belongs to, or ``None``."""
         return self.sessions.verify_token(token)
+
+    def status_snapshot(self) -> dict:
+        """The desk at a glance: state, load, temperature, what is scheduled.
+
+        Cheap on purpose - the phone polls it every few seconds. nvidia-smi is the
+        slow part, so its answer is cached for a couple of seconds.
+        """
+        snapshot: dict[str, Any] = {"state": self.current_state(), "ok": True}
+        now = time.monotonic()
+        cached = getattr(self, "_status_cache", None)
+        if cached and now - cached[0] < 2.5:
+            return cached[1]
+        try:
+            import psutil  # noqa: PLC0415
+
+            snapshot["cpu"] = round(psutil.cpu_percent(interval=None))
+            snapshot["ram"] = round(psutil.virtual_memory().percent)
+            snapshot["uptime_s"] = int(time.time() - psutil.boot_time())
+        except Exception:  # noqa: BLE001 - psutil is optional
+            pass
+        try:
+            from jarvis.tools.system_tools import _gpu_info  # noqa: PLC0415
+
+            gpu = _gpu_info()
+            if gpu:
+                snapshot["gpu"] = {k: round(v) for k, v in gpu.items()}
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            scheduler = getattr(getattr(self.assistant, "parts", None), "scheduler", None)
+            jobs = scheduler.pending() if scheduler is not None else []
+            snapshot["timers"] = [
+                {"id": j.id, "label": j.label or j.text or j.kind, "due": j.due, "kind": j.kind}
+                for j in sorted(jobs, key=lambda j: j.due)[:5]
+            ]
+        except Exception:  # noqa: BLE001
+            snapshot["timers"] = []
+        self._status_cache = (now, snapshot)
+        return snapshot
 
     def current_state(self) -> str:
         bus = self._state_bus()
@@ -425,6 +480,10 @@ class RemoteServer:
         device = self._authorise(ws)
         if device is None:
             return
+        try:
+            ws._jarvis_device = device  # so a typed "say" frame knows who is asking
+        except Exception:  # noqa: BLE001 - a socket object that refuses attributes
+            pass
         max_samples = int(self.max_audio_seconds * 16000)
         while not self._closing.is_set():
             try:
@@ -460,30 +519,45 @@ class RemoteServer:
             return _send(ws, {"type": "pong"})
         if kind == "hello":
             return _send(ws, {"type": "ready", "state": self.current_state()})
+        if kind == "say":
+            text = str((data or {}).get("text", "") or "").strip()[:2000]
+            if not text:
+                return _send(ws, {"type": "error", "message": "Nothing to say."})
+            device = getattr(ws, "_jarvis_device", None) or Device(name="phone", id="")
+            return self._run_turn(ws, device, None, text=text)
         return _send(ws, {"type": "error", "message": f"Unknown message {kind or 'without a type'}."})
 
-    def _run_turn(self, ws: Any, device: Device, audio: Any) -> bool:
+    def _run_turn(self, ws: Any, device: Device, audio: Any, *, text: str = "") -> bool:
         """Queue one turn and stream its sentences back. Returns False on a dead socket.
 
         Every send happens on this thread: the worker pushes into a queue and this
         loop drains it, so two threads never write to the same socket at once.
         """
         outbox: "queue.Queue[dict]" = queue.Queue()
+        guard = self.guard_for(device)
+
+        def wrap(inner: Any) -> Any:
+            # The reporter sits outside the guard, so a refusal is reported too.
+            return ToolReporter(guard(inner), outbox.put)
+
         turn = RemoteTurn(
             audio=audio,
             sample_rate=16000,
             device=device.name,
-            on_sentence=lambda text: outbox.put({"type": "sentence", "text": text}),
-            on_transcript=lambda text: outbox.put({"type": "transcript", "text": text}),
+            text=text,
+            on_sentence=lambda sentence: outbox.put({"type": "sentence", "text": sentence}),
+            on_transcript=lambda heard: outbox.put({"type": "transcript", "text": heard}),
             on_done=lambda reply, error: outbox.put(
                 {"type": "done", "reply": reply, "error": error}
             ),
-            wrap_dispatcher=self.guard_for(device),
+            on_tool=outbox.put,
+            wrap_dispatcher=wrap,
             speak_locally=self.speak_locally,
         )
-        self.log.info(
-            "Remote turn from %s: %.1f s of audio.", device, turn.duration_s
-        )
+        if text:
+            self.log.info("Remote turn from %s (typed): %r", device, text[:80])
+        else:
+            self.log.info("Remote turn from %s: %.1f s of audio.", device, turn.duration_s)
         submit = getattr(self.assistant, "submit_remote_turn", None)
         if not callable(submit):
             self.log.error(MISSING_HOOK)

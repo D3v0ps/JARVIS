@@ -498,9 +498,15 @@ class Assistant:
         text = (getattr(turn, "text", "") or "").strip()
         audio = getattr(turn, "audio", None)
         if not text and audio is not None:
+            self.parts.latency.start_turn()
             transcript = self.parts.transcriber.transcribe(audio, self.sample_rate)
             self.parts.latency.mark("text")
             text = (transcript.text or "").strip()
+            if text:
+                # Show the phone what was heard, before the answer starts.
+                report = getattr(turn, "transcribed", None)
+                if callable(report):
+                    report(text)
         if not text:
             turn.finish("", error="I couldn't make that out, sir.")
             return
@@ -520,15 +526,30 @@ class Assistant:
             if self.cfg.get("remote.speak_locally", False):
                 self.parts.speaker.enqueue(sentence)
 
+        # The phone's guard wraps the dispatcher for exactly this turn. Without it a
+        # remote caller gets the desk's rules, and type_text would send blind
+        # keystrokes into whatever window is focused here.
+        brain = self.parts.brain
+        original_dispatcher = brain.dispatcher
+        wrap = getattr(turn, "wrap_dispatcher", None)
+        if callable(wrap):
+            try:
+                brain.dispatcher = wrap(original_dispatcher)
+            except Exception as exc:  # noqa: BLE001 - no guard means no turn
+                self.log.error("Could not apply the remote guard: %s", exc)
+                turn.finish("", error="I can't take that from the phone right now, sir.")
+                return
+
         self._stop_turn.clear()
         try:
-            result = self.parts.brain.turn(text, on_sentence=on_sentence,
-                                           should_stop=self._stop_turn.is_set)
+            result = brain.turn(text, on_sentence=on_sentence,
+                                should_stop=self._stop_turn.is_set)
             turn.finish(" ".join(spoken).strip() or result.reply, error=result.error)
         except Exception as exc:  # noqa: BLE001
             self.log.exception("The remote turn failed: %s", exc)
             turn.finish("", error="Something went wrong on my end, sir.")
         finally:
+            brain.dispatcher = original_dispatcher
             self.parts.latency.end_turn()
 
     def _on_sentence(self, sentence: str) -> None:

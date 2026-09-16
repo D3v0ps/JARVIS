@@ -142,6 +142,7 @@ DEFAULTS: Final[dict[str, Any]] = {
         "enabled": False,
         "host": "127.0.0.1",
         "port": 8765,
+        "url": "",
         "allow_guarded": False,
         "speak_locally": False,
         "routines": [],

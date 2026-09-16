@@ -10,7 +10,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="JARVIS">
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <style>
   /* The same palette as the desk's arc-reactor HUD: idle blue, listening cyan,
@@ -18,6 +18,7 @@
   :root {
     --bg: #05080c;
     --panel: rgba(18, 30, 40, 0.62);
+    --panel-2: rgba(12, 22, 30, 0.85);
     --edge: rgba(41, 182, 246, 0.22);
     --ink: #d8ecf7;
     --dim: #6f8494;
@@ -28,7 +29,8 @@
     --paused: #5c6670;
     --bad: #ff6f60;
     --accent: var(--idle);
-    --tap: 46vw;
+    --ring: 152px;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; margin: 0; }
@@ -39,12 +41,17 @@
     color: var(--ink);
     font: 16px/1.45 "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column;
-    padding: env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 12px);
+    padding: env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 10px);
     overflow: hidden; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
   }
+  input { -webkit-user-select: text; user-select: text; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+
+  /* --- header ------------------------------------------------------------- */
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 2px 6px; letter-spacing: 0.38em; font-size: 13px;
+    padding: 12px 2px 4px; letter-spacing: 0.38em; font-size: 13px;
     text-transform: uppercase; color: var(--dim);
   }
   header b { color: var(--ink); font-weight: 600; letter-spacing: 0.42em; }
@@ -52,11 +59,31 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); transition: background .3s; }
   .dot.on { background: var(--speaking); box-shadow: 0 0 10px var(--speaking); }
 
+  /* --- telemetry strip ------------------------------------------------------ */
+  #telemetry {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 6px 0 2px;
+  }
+  .stat {
+    background: var(--panel); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px;
+    padding: 7px 8px 6px; display: flex; flex-direction: column; align-items: center; gap: 1px;
+  }
+  .stat .k { font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); }
+  .stat .v { font: 500 15px/1.2 var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+  .stat.hot .v { color: var(--thinking); }
+  .stat.live .v { color: var(--listening); }
+
   main { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
 
-  /* --- the ring ------------------------------------------------------------ */
-  .ring-wrap { display: flex; flex-direction: column; align-items: center; padding: 6px 0 2px; }
-  .ring { width: 172px; height: 172px; display: block; }
+  /* --- the reactor is the button ----------------------------------------------- */
+  .stage { display: flex; flex-direction: column; align-items: center; padding: 4px 0 0; }
+  #talk {
+    width: var(--ring); height: var(--ring); padding: 0; border: 0; border-radius: 50%;
+    background: none; display: block; transition: transform .12s ease;
+    touch-action: manipulation;
+  }
+  #talk:active { transform: scale(0.95); }
+  #talk:disabled { opacity: .5; }
+  .ring { width: 100%; height: 100%; display: block; }
   .ring .coil, .ring .sweep { transform-origin: 50% 50%; }
   .ring .core, .ring .bloom { transition: opacity .35s ease, r .35s ease; }
   .ring .sweep { opacity: 0; transform-origin: 50% 50%; }
@@ -91,49 +118,95 @@
   body[data-state="speaking"] .core  { animation: corebeat .9s ease-in-out infinite; }
   body[data-state="speaking"] .halo  { animation: breathe 1.4s ease-in-out infinite; }
 
-  .caption { margin-top: 8px; font-size: 12px; letter-spacing: 0.34em; text-transform: uppercase; color: var(--accent); }
-  .note { min-height: 18px; margin-top: 4px; font-size: 13px; color: var(--dim); text-align: center; }
+  /* paused: grey and still */
+  body[data-state="paused"] .coil  { opacity: .3; }
+  body[data-state="paused"] .core  { opacity: .4; }
+  body[data-state="paused"] .bloom { opacity: .3; }
 
-  /* --- the exchanges -------------------------------------------------------- */
+  .caption { margin-top: 4px; font-size: 12px; letter-spacing: 0.34em; text-transform: uppercase; color: var(--accent); transition: color .3s; }
+  .note { min-height: 17px; font-size: 12px; color: var(--dim); text-align: center; }
+
+  /* --- the feed: lines and cards ------------------------------------------------ */
   #log {
     flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
-    margin: 10px 0 4px; padding: 2px; display: flex; flex-direction: column; gap: 8px;
+    margin: 6px 0 4px; padding: 2px; display: flex; flex-direction: column; gap: 8px;
+    mask-image: linear-gradient(to bottom, transparent, #000 14px);
+    -webkit-mask-image: linear-gradient(to bottom, transparent, #000 14px);
   }
-  .line { padding: 10px 13px; border-radius: 14px; max-width: 86%; font-size: 15px; }
-  .line.you { align-self: flex-end; background: rgba(41,182,246,0.14); border: 1px solid var(--edge); }
-  .line.him { align-self: flex-start; background: var(--panel); border: 1px solid rgba(255,255,255,0.05); }
+  #log:empty::before {
+    content: "Tap the reactor and speak, or type below.";
+    margin: auto; font-size: 13px; color: var(--dim); text-align: center; padding: 0 30px;
+  }
+  .line { padding: 10px 13px; border-radius: 16px; max-width: 86%; font-size: 15px; -webkit-user-select: text; user-select: text; }
+  .line.you { align-self: flex-end; background: rgba(41,182,246,0.14); border: 1px solid var(--edge); border-bottom-right-radius: 5px; }
+  .line.him { align-self: flex-start; background: var(--panel); border: 1px solid rgba(255,255,255,0.05); border-bottom-left-radius: 5px; }
   .line.err { align-self: center; background: rgba(255,111,96,0.13); color: #ffd9d4; border: 1px solid rgba(255,111,96,0.3); font-size: 14px; }
 
-  /* --- routines ------------------------------------------------------------- */
-  #routines { display: flex; gap: 8px; overflow-x: auto; padding: 4px 2px 8px; scrollbar-width: none; }
+  .card {
+    align-self: stretch; background: var(--panel-2); border: 1px solid var(--edge);
+    border-left: 3px solid var(--listening); border-radius: 14px; padding: 9px 12px 10px;
+    display: flex; flex-direction: column; gap: 6px; -webkit-user-select: text; user-select: text;
+  }
+  .card.failed  { border-left-color: var(--thinking); }
+  .card.refused { border-left-color: var(--bad); }
+  .card-head { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--dim); }
+  .card-head .glyph { font-size: 14px; color: var(--listening); letter-spacing: 0; }
+  .card.failed .glyph { color: var(--thinking); }
+  .card.refused .glyph { color: var(--bad); }
+  .card-head .chip { margin-left: auto; font: 500 10px/1 var(--mono); letter-spacing: 0.1em; padding: 4px 7px; border-radius: 8px; background: rgba(41,182,246,0.12); color: var(--listening); }
+  .card.failed .chip  { background: rgba(255,179,0,0.12); color: var(--thinking); }
+  .card.refused .chip { background: rgba(255,111,96,0.14); color: var(--bad); }
+  .card-title { font-size: 17px; font-weight: 600; letter-spacing: 0.01em; }
+  .card-big { font: 500 34px/1 var(--mono); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .card-sub { font-size: 13px; color: var(--dim); }
+  .card-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: var(--dim); }
+  .card-row b { color: var(--ink); font-weight: 500; font-family: var(--mono); }
+  .card-text { font-size: 14px; }
+  .card-actions { display: flex; gap: 8px; margin-top: 2px; }
+  .card-actions a, .card-actions button {
+    flex: 1 1 0; text-align: center; text-decoration: none; padding: 11px 10px; border-radius: 11px;
+    background: rgba(41,182,246,0.16); border: 1px solid var(--edge); color: var(--ink);
+    font-size: 14px; font-weight: 500; letter-spacing: 0.04em;
+  }
+  .card-actions a.primary { background: rgba(62,224,200,0.18); border-color: rgba(62,224,200,0.35); }
+  .card-actions a:active, .card-actions button:active { filter: brightness(1.3); }
+  .card-list { display: flex; flex-direction: column; gap: 6px; }
+  .card-list a { color: var(--ink); text-decoration: none; display: block; font-size: 14px; }
+  .card-list a small { display: block; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* --- footer: routines and the composer ---------------------------------------- */
+  footer { display: flex; flex-direction: column; gap: 6px; padding-top: 2px; }
+  #routines { display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 2px; scrollbar-width: none; }
+  #routines:empty { display: none; }
   #routines::-webkit-scrollbar { display: none; }
   #routines button {
-    flex: 0 0 auto; min-height: 52px; padding: 0 20px; border-radius: 26px;
+    flex: 0 0 auto; min-height: 40px; padding: 0 16px; border-radius: 20px;
     background: var(--panel); border: 1px solid var(--edge); color: var(--ink);
-    font-size: 15px; letter-spacing: 0.04em;
+    font-size: 14px; letter-spacing: 0.02em;
   }
   #routines button:active { background: rgba(41,182,246,0.22); }
-
+  #composer { display: flex; gap: 8px; align-items: center; }
+  #text {
+    flex: 1 1 auto; min-width: 0; height: 46px; padding: 0 16px; border-radius: 23px;
+    background: var(--panel); border: 1px solid var(--edge); color: var(--ink); font: inherit; font-size: 16px;
+    outline: none;
+  }
+  #text:focus { border-color: rgba(41,182,246,0.5); }
+  #text::placeholder { color: var(--dim); }
+  #send {
+    flex: 0 0 auto; width: 46px; height: 46px; border-radius: 50%; border: 1px solid var(--edge);
+    background: rgba(41,182,246,0.18); display: grid; place-items: center;
+  }
+  #send:active { background: rgba(41,182,246,0.32); }
+  #send:disabled { opacity: .4; }
+  #send svg { width: 20px; height: 20px; }
   .ghost {
-    align-self: flex-end; margin: 0 4px 2px; padding: 6px 10px; background: none;
-    border: 0; color: var(--dim); font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase;
+    align-self: center; margin: 0; padding: 4px 10px 0; background: none;
+    border: 0; color: var(--dim); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase;
   }
   .ghost[hidden] { display: none; }
 
-  /* --- the button ----------------------------------------------------------- */
-  .talk-wrap { display: flex; justify-content: center; padding: 6px 0 2px; }
-  #talk {
-    width: var(--tap); height: var(--tap); max-width: 190px; max-height: 190px;
-    min-width: 132px; min-height: 132px; border-radius: 50%;
-    border: 2px solid var(--accent); background: radial-gradient(circle at 50% 40%, rgba(41,182,246,0.20), rgba(8,14,20,0.9));
-    color: var(--ink); font-size: 14px; letter-spacing: 0.22em; text-transform: uppercase;
-    box-shadow: 0 0 34px -8px var(--accent); transition: transform .12s ease, box-shadow .3s ease;
-  }
-  #talk:active { transform: scale(0.96); }
-  #talk[data-armed="1"] { box-shadow: 0 0 60px -6px var(--listening); background: radial-gradient(circle at 50% 40%, rgba(41,182,246,0.42), rgba(8,14,20,0.9)); }
-  #talk:disabled { opacity: .45; }
-
-  /* --- pairing -------------------------------------------------------------- */
+  /* --- pairing ------------------------------------------------------------------ */
   #pair {
     position: fixed; inset: 0; background: rgba(3,6,9,0.96); z-index: 20;
     display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 24px;
@@ -142,9 +215,9 @@
   #pair h1 { font-size: 15px; letter-spacing: 0.34em; text-transform: uppercase; color: var(--dim); font-weight: 500; margin: 0; }
   #pair input {
     width: 100%; max-width: 280px; padding: 16px; border-radius: 14px; text-align: center;
-    background: var(--panel); border: 1px solid var(--edge); color: var(--ink);
+    background: var(--panel); border: 1px solid var(--edge); color: var(--ink); font: inherit;
   }
-  #code { font-size: 34px; letter-spacing: 0.4em; }
+  #code { font: 500 34px/1.2 var(--mono); letter-spacing: 0.4em; }
   #pair button {
     width: 100%; max-width: 280px; padding: 16px; border-radius: 14px; border: 1px solid var(--edge);
     background: rgba(41,182,246,0.18); color: var(--ink); font-size: 16px; letter-spacing: 0.18em; text-transform: uppercase;
@@ -160,69 +233,85 @@
   <span class="link"><span id="dot" class="dot"></span><span id="linkText">offline</span></span>
 </header>
 
+<section id="telemetry" aria-label="Desk telemetry">
+  <div class="stat" id="sCpu"><span class="k">CPU</span><span class="v">--</span></div>
+  <div class="stat" id="sRam"><span class="k">RAM</span><span class="v">--</span></div>
+  <div class="stat" id="sGpu"><span class="k">GPU</span><span class="v">--</span></div>
+  <div class="stat" id="sTimer"><span class="k">Timer</span><span class="v">--</span></div>
+</section>
+
 <main>
-  <div class="ring-wrap">
-    <svg class="ring" viewBox="0 0 100 100" aria-hidden="true">
-      <defs>
-        <radialGradient id="halo-g">
-          <stop offset="55%" stop-color="var(--accent)" stop-opacity="0"/>
-          <stop offset="82%" stop-color="var(--accent)" stop-opacity="0.30"/>
-          <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
-        </radialGradient>
-        <radialGradient id="core-g">
-          <stop offset="0%" stop-color="#ffffff" stop-opacity="1"/>
-          <stop offset="38%" stop-color="#ffffff" stop-opacity="0.85"/>
-          <stop offset="70%" stop-color="var(--accent)" stop-opacity="0.45"/>
-          <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
-        </radialGradient>
-        <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur stdDeviation="1.6" result="b"/>
-          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-        </filter>
-      </defs>
+  <div class="stage">
+    <button id="talk" data-armed="0" aria-label="Talk to JARVIS">
+      <svg class="ring" viewBox="0 0 100 100" aria-hidden="true">
+        <defs>
+          <radialGradient id="halo-g">
+            <stop offset="55%" stop-color="var(--accent)" stop-opacity="0"/>
+            <stop offset="82%" stop-color="var(--accent)" stop-opacity="0.30"/>
+            <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+          </radialGradient>
+          <radialGradient id="core-g">
+            <stop offset="0%" stop-color="#ffffff" stop-opacity="1"/>
+            <stop offset="38%" stop-color="#ffffff" stop-opacity="0.85"/>
+            <stop offset="70%" stop-color="var(--accent)" stop-opacity="0.45"/>
+            <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+          </radialGradient>
+          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="1.6" result="b"/>
+            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
 
-      <!-- outer glow -->
-      <circle class="halo" cx="50" cy="50" r="50" fill="url(#halo-g)"/>
+        <!-- outer glow -->
+        <circle class="halo" cx="50" cy="50" r="50" fill="url(#halo-g)"/>
 
-      <!-- the eight coils, as one dashed band -->
-      <g class="coil" filter="url(#glow)">
-        <circle cx="50" cy="50" r="29.05" fill="none" stroke="var(--accent)"
-                stroke-width="11.90" stroke-dasharray="18.25 4.56" opacity="0.9"/>
-      </g>
+        <!-- the eight coils, as one dashed band -->
+        <g class="coil" filter="url(#glow)">
+          <circle cx="50" cy="50" r="29.05" fill="none" stroke="var(--accent)"
+                  stroke-width="11.90" stroke-dasharray="18.25 4.56" opacity="0.9"/>
+        </g>
 
-      <!-- a comet that sweeps the band while he is working -->
-      <g class="sweep">
-        <circle cx="50" cy="50" r="29.05" fill="none" stroke="#ffffff"
-                stroke-width="11.90" stroke-linecap="round"
-                stroke-dasharray="20.53 182.53" opacity="0.5"/>
-      </g>
+        <!-- a comet that sweeps the band while he is working -->
+        <g class="sweep">
+          <circle cx="50" cy="50" r="29.05" fill="none" stroke="#ffffff"
+                  stroke-width="11.90" stroke-linecap="round"
+                  stroke-dasharray="20.53 182.53" opacity="0.5"/>
+        </g>
 
-      <!-- outer rim and inner ring -->
-      <circle class="rim" cx="50" cy="50" r="37.2" fill="none"
-              stroke="var(--accent)" stroke-width="2.4" opacity="0.75" filter="url(#glow)"/>
-      <circle class="inner" cx="50" cy="50" r="19.1" fill="none"
-              stroke="var(--accent)" stroke-width="2.6" opacity="0.9" filter="url(#glow)"/>
+        <!-- outer rim and inner ring -->
+        <circle class="rim" cx="50" cy="50" r="37.2" fill="none"
+                stroke="var(--accent)" stroke-width="2.4" opacity="0.75" filter="url(#glow)"/>
+        <circle class="inner" cx="50" cy="50" r="19.1" fill="none"
+                stroke="var(--accent)" stroke-width="2.6" opacity="0.9" filter="url(#glow)"/>
 
-      <!-- a wave leaving the core while he speaks -->
-      <circle class="wave" cx="50" cy="50" r="8" fill="none"
-              stroke="var(--accent)" stroke-width="1.6" opacity="0"/>
+        <!-- a wave leaving the core while he speaks -->
+        <circle class="wave" cx="50" cy="50" r="8" fill="none"
+                stroke="var(--accent)" stroke-width="1.6" opacity="0"/>
 
-      <!-- the white-hot core -->
-      <circle class="bloom" cx="50" cy="50" r="14.2" fill="url(#core-g)"/>
-      <circle class="core" cx="50" cy="50" r="7.5" fill="#ffffff" opacity="0.95"/>
-    </svg>
-    <div class="caption" id="caption">idle</div>
+        <!-- the white-hot core -->
+        <circle class="bloom" cx="50" cy="50" r="14.2" fill="url(#core-g)"/>
+        <circle class="core" cx="50" cy="50" r="7.5" fill="#ffffff" opacity="0.95"/>
+      </svg>
+    </button>
+    <div class="caption" id="caption">tap to talk</div>
     <div class="note" id="note"></div>
   </div>
 
   <div id="log" aria-live="polite"></div>
-  <div id="routines"></div>
-  <button id="forget" class="ghost" hidden>forget this phone</button>
-
-  <div class="talk-wrap">
-    <button id="talk" data-armed="0">tap to talk</button>
-  </div>
 </main>
+
+<footer>
+  <div id="routines"></div>
+  <form id="composer" autocomplete="off">
+    <input id="text" type="text" placeholder="Type to JARVIS" enterkeyhint="send" maxlength="2000">
+    <button id="send" type="submit" aria-label="Send">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 19V5"/><path d="M6 11l6-6 6 6"/>
+      </svg>
+    </button>
+  </form>
+  <button id="forget" class="ghost" hidden>forget this phone</button>
+</footer>
 
 <section id="pair" hidden>
   <h1>Pair this phone</h1>
@@ -241,11 +330,14 @@
 "use strict";
 const VAD_ASSETS = "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/";
 const ORT_ASSETS = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/";
+const STATUS_EVERY_MS = 4000;
 
 const el = (id) => document.getElementById(id);
 const ui = {
   body: document.body, dot: el("dot"), linkText: el("linkText"), caption: el("caption"),
   note: el("note"), log: el("log"), routines: el("routines"), talk: el("talk"),
+  composer: el("composer"), text: el("text"), send: el("send"),
+  stats: { cpu: el("sCpu"), ram: el("sRam"), gpu: el("sGpu"), timer: el("sTimer") },
   pair: el("pair"), code: el("code"), deviceName: el("deviceName"),
   pairGo: el("pairGo"), pairNote: el("pairNote"), forget: el("forget")
 };
@@ -254,42 +346,62 @@ const app = {
   audioCtx: null,      // created inside the tap handler; iOS is silent otherwise
   vad: null,           // MicVAD, built on first tap so permission is asked then
   armed: false,
+  deskState: "idle",   // what the desk says it is doing
   audioWs: null,
   stateWs: null,
   stateTries: 0,
-  audioTries: 0,
   voice: null,
   busy: false,
   replyOpen: false,
-  suspended: false
+  suspended: false,
+  paired: false,
+  statusTimer: null,
+  nextDue: null        // epoch seconds of the soonest timer, for the strip
 };
 
 /* ---------------------------------------------------------------- small helpers */
-function setState(state) {
+const CAPTIONS = { idle: "tap to talk", listening: "listening", thinking: "working", speaking: "speaking", paused: "paused" };
+
+/* The ring shows the desk's state, except that an armed microphone here counts
+   as listening even while the desk itself is idle. */
+function render() {
   const known = ["idle", "listening", "thinking", "speaking", "paused"];
-  const value = known.indexOf(state) >= 0 ? state : "idle";
+  let value = known.indexOf(app.deskState) >= 0 ? app.deskState : "idle";
+  if (value === "idle" && app.armed) value = "listening";
   ui.body.dataset.state = value;
   document.documentElement.style.setProperty("--accent", `var(--${value})`);
-  ui.caption.textContent = value === "thinking" ? "working" : value;
+  ui.caption.textContent = CAPTIONS[value];
 }
+function setState(state) { app.deskState = state; render(); }
 function setLink(up, text) {
   ui.dot.classList.toggle("on", !!up);
   ui.linkText.textContent = text || (up ? "linked" : "offline");
 }
 function say(text) { ui.note.textContent = text || ""; }
+function buzz(pattern) {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (err) { /* not every phone */ }
+}
+function node(tag, className, text) {
+  const made = document.createElement(tag);
+  if (className) made.className = className;
+  if (text !== undefined && text !== null && text !== "") made.textContent = String(text);
+  return made;
+}
+function post(element) {
+  ui.log.appendChild(element);
+  while (ui.log.children.length > 30) ui.log.removeChild(ui.log.firstChild);
+  ui.log.scrollTop = ui.log.scrollHeight;
+  return element;
+}
 
 function addLine(kind, text) {
   if (!text) return null;
-  const node = document.createElement("div");
-  node.className = "line " + kind;
-  node.textContent = text;
-  ui.log.appendChild(node);
-  while (ui.log.children.length > 12) ui.log.removeChild(ui.log.firstChild);
-  ui.log.scrollTop = ui.log.scrollHeight;
-  return node;
+  return post(node("div", "line " + kind, text));
 }
 function appendReply(text) {
   const last = ui.log.lastElementChild;
+  /* A refusal is spoken as well as reported; the card already says it. */
+  if (last && last.classList.contains("card") && last.dataset.summary === text) return;
   if (app.replyOpen && last && last.classList.contains("him")) {
     last.textContent = (last.textContent + " " + text).trim();
     ui.log.scrollTop = ui.log.scrollHeight;
@@ -306,6 +418,236 @@ async function api(path, body) {
   let data = {};
   try { data = await response.json(); } catch (err) { data = {}; }
   return { status: response.status, data: data };
+}
+
+/* ------------------------------------------------------------------- the cards */
+/* One card per tool call, drawn from the event the desk streams before the
+   sentence that describes it. Only the keys the desk considers safe arrive. */
+const FACES = {
+  find_business: ["☎", "Business"], recall_business: ["☎", "Business"],
+  dial_number: ["☎", "Call"], end_call: ["☎", "Call"],
+  set_timer: ["◷", "Timer"], set_reminder: ["◷", "Reminder"],
+  list_timers: ["◷", "Timers"], cancel_timer: ["◷", "Timer"],
+  get_time_date: ["◷", "Clock"],
+  weather: ["☁", "Weather"], web_search: ["⌕", "Search"], open_url: ["⌕", "Web"],
+  system_status: ["▤", "System"], screenshot: ["▣", "Screenshot"],
+  open_app: ["▶", "App"], close_app: ["■", "App"],
+  media: ["♪", "Media"], volume: ["♪", "Volume"],
+  clipboard: ["⎘", "Clipboard"], remember: ["◈", "Memory"],
+  recall: ["◈", "Memory"], forget: ["◈", "Memory"],
+  file_ops: ["☰", "Files"], find_file: ["☰", "Files"],
+  run_powershell: ["❯", "PowerShell"], power: ["⏻", "Power"], lock_pc: ["⏻", "Lock"],
+  type_text: ["⌨", "Keyboard"], deep_think: ["◈", "Thinking"]
+};
+function prettify(name) { return String(name || "tool").replace(/_/g, " "); }
+function telHref(phone) { return "tel:" + String(phone || "").replace(/[^\d+]/g, ""); }
+function clock(epoch) {
+  const when = new Date(Number(epoch) * 1000);
+  return isNaN(when.getTime()) ? "" : when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function countdown(epoch) {
+  const left = Math.max(0, Math.round(Number(epoch) - Date.now() / 1000));
+  const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), s = left % 60;
+  const two = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${two(m)}:${two(s)}`;
+}
+function row(pairs) {
+  const made = node("div", "card-row");
+  pairs.forEach(([label, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    const cell = node("span", "", label + " ");
+    cell.appendChild(node("b", "", value));
+    made.appendChild(cell);
+  });
+  return made.childElementCount ? made : null;
+}
+function businessBody(d, body, actions) {
+  body.appendChild(node("div", "card-title", d.name));
+  if (d.address) body.appendChild(node("div", "card-sub", d.address));
+  if (d.opening_hours) body.appendChild(node("div", "card-sub", d.opening_hours));
+  if (d.phone) {
+    const call = node("a", "primary", "Call " + d.phone);
+    call.href = telHref(d.phone);
+    actions.appendChild(call);
+  }
+  if (d.website) {
+    const site = node("a", "", "Website");
+    site.href = d.website; site.target = "_blank"; site.rel = "noopener";
+    actions.appendChild(site);
+  }
+}
+function cardBody(ev, body, actions) {
+  const d = ev.data || {};
+  switch (ev.name) {
+    case "find_business":
+    case "recall_business":
+      if (d.name) { businessBody(d, body, actions); return true; }
+      if (Array.isArray(d.places) && d.places.length) {
+        const list = node("div", "card-list");
+        d.places.slice(0, 4).forEach((place) => {
+          if (!place || !place.name) return;
+          const item = node("a", "", place.name);
+          if (place.phone) item.href = telHref(place.phone);
+          item.appendChild(node("small", "", place.phone || place.address || ""));
+          list.appendChild(item);
+        });
+        body.appendChild(list);
+        return true;
+      }
+      return false;
+    case "set_timer": {
+      body.appendChild(node("div", "card-sub", d.label || "Timer"));
+      const big = node("div", "card-big", countdown(d.due));
+      big.dataset.due = String(d.due || "");
+      body.appendChild(big);
+      const meta = row([["until", clock(d.due)]]);
+      if (meta) body.appendChild(meta);
+      return true;
+    }
+    case "set_reminder":
+      body.appendChild(node("div", "card-title", d.text || "Reminder"));
+      body.appendChild(node("div", "card-sub", d.when ? d.when + (d.due ? " · " + clock(d.due) : "") : clock(d.due)));
+      return true;
+    case "list_timers":
+      if (Array.isArray(d.jobs) && d.jobs.length) {
+        d.jobs.slice(0, 5).forEach((job) => {
+          const line = node("div", "card-row");
+          line.appendChild(node("span", "", job.label || job.text || job.kind || "timer"));
+          const left = node("b", "", countdown(job.due));
+          left.dataset.due = String(job.due || "");
+          line.appendChild(left);
+          body.appendChild(line);
+        });
+        return true;
+      }
+      return false;
+    case "weather": {
+      const temp = d.temperature_c !== undefined ? Math.round(Number(d.temperature_c)) + "°" : "";
+      if (temp) body.appendChild(node("div", "card-big", temp));
+      const where = [d.condition, d.city].filter(Boolean).join(" · ");
+      if (where) body.appendChild(node("div", "card-title", where));
+      const meta = row([
+        ["high", d.high_c !== undefined ? Math.round(Number(d.high_c)) + "°" : ""],
+        ["low", d.low_c !== undefined ? Math.round(Number(d.low_c)) + "°" : ""],
+        ["wind", d.wind_ms !== undefined ? Math.round(Number(d.wind_ms)) + " m/s" : ""],
+        ["feels", d.apparent_c !== undefined ? Math.round(Number(d.apparent_c)) + "°" : ""]
+      ]);
+      if (meta) body.appendChild(meta);
+      return !!(temp || where);
+    }
+    case "system_status": {
+      const meta = row([
+        ["cpu", d.cpu_percent !== undefined ? Math.round(Number(d.cpu_percent)) + "%" : ""],
+        ["ram", d.ram_used_gb !== undefined ? d.ram_used_gb + "/" + d.ram_total_gb + " GB" : ""],
+        ["gpu", d.gpu_percent !== undefined ? Math.round(Number(d.gpu_percent)) + "%" : ""],
+        ["temp", d.gpu_temperature_c !== undefined ? Math.round(Number(d.gpu_temperature_c)) + "°C" : ""],
+        ["disk", d.disk_free_gb !== undefined ? d.disk_free_gb + " GB free" : ""]
+      ]);
+      if (meta) { body.appendChild(meta); return true; }
+      return false;
+    }
+    case "web_search":
+      if (Array.isArray(d.results) && d.results.length) {
+        const list = node("div", "card-list");
+        d.results.slice(0, 3).forEach((hit) => {
+          if (!hit || !(hit.title || hit.url)) return;
+          const item = node("a", "", hit.title || hit.url);
+          if (hit.url) { item.href = hit.url; item.target = "_blank"; item.rel = "noopener"; }
+          item.appendChild(node("small", "", hit.body || hit.url || ""));
+          list.appendChild(item);
+        });
+        body.appendChild(list);
+        return true;
+      }
+      return false;
+    case "open_url":
+      if (d.url) {
+        body.appendChild(node("div", "card-title", d.title || d.url));
+        const open = node("a", "", "Open here too");
+        open.href = d.url; open.target = "_blank"; open.rel = "noopener";
+        actions.appendChild(open);
+        return true;
+      }
+      return false;
+    case "open_app":
+    case "close_app":
+      if (d.app) { body.appendChild(node("div", "card-title", d.app)); return true; }
+      return false;
+    case "get_time_date":
+      if (d.time) {
+        body.appendChild(node("div", "card-big", d.time));
+        body.appendChild(node("div", "card-sub", [d.weekday, d.date].filter(Boolean).join(" · ")));
+        return true;
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+function addCard(ev) {
+  const face = FACES[ev.name] || ["◇", prettify(ev.name)];
+  const status = ev.refused ? "refused" : ev.ok ? "done" : "failed";
+  const card = node("div", "card" + (status === "done" ? "" : " " + status));
+  const head = node("div", "card-head");
+  head.appendChild(node("span", "glyph", face[0]));
+  head.appendChild(node("span", "tool", face[1]));
+  head.appendChild(node("span", "chip", status + (ev.ms ? " · " + ev.ms + " ms" : "")));
+  card.appendChild(head);
+  const body = node("div", "card-body");
+  const actions = node("div", "card-actions");
+  const drawn = status === "done" && cardBody(ev, body, actions);
+  if (!drawn) {
+    body.appendChild(node("div", "card-text", ev.summary || (status === "done" ? "Done." : "That did not work.")));
+    card.dataset.summary = ev.summary || "";
+  }
+  card.appendChild(body);
+  if (actions.childElementCount) card.appendChild(actions);
+  return post(card);
+}
+/* Every countdown on screen, in the strip and in the cards, ticks from here. */
+setInterval(() => {
+  document.querySelectorAll("[data-due]").forEach((element) => {
+    if (element.dataset.due) element.textContent = countdown(element.dataset.due);
+  });
+  if (app.nextDue) ui.stats.timer.lastElementChild.textContent = countdown(app.nextDue);
+}, 1000);
+
+/* --------------------------------------------------------------- the telemetry */
+function drawStat(stat, text, flags) {
+  stat.lastElementChild.textContent = text;
+  stat.classList.toggle("hot", !!(flags && flags.hot));
+  stat.classList.toggle("live", !!(flags && flags.live));
+}
+function drawStatus(s) {
+  if (!s || typeof s !== "object") return;
+  if (s.state) setState(s.state);
+  drawStat(ui.stats.cpu, s.cpu !== undefined ? s.cpu + "%" : "--", { hot: s.cpu >= 85 });
+  drawStat(ui.stats.ram, s.ram !== undefined ? s.ram + "%" : "--", { hot: s.ram >= 90 });
+  const gpu = s.gpu || {};
+  const temp = gpu.temperature_c;
+  drawStat(ui.stats.gpu, temp !== undefined ? temp + "°" : (gpu.util_percent !== undefined ? gpu.util_percent + "%" : "--"),
+           { hot: temp >= 80 });
+  const soonest = (s.timers || []).filter((t) => t && t.due).sort((a, b) => a.due - b.due)[0];
+  app.nextDue = soonest ? Number(soonest.due) : null;
+  drawStat(ui.stats.timer, soonest ? countdown(soonest.due) : "--", { live: !!soonest });
+  ui.stats.timer.title = soonest ? (soonest.label || "") : "";
+}
+async function pollStatus() {
+  if (app.suspended || !app.paired) return;
+  try {
+    const answer = await api("/api/status");
+    if (answer.status === 401) { showPairing("Pair this phone again."); return; }
+    if (answer.status === 200) drawStatus(answer.data);
+  } catch (err) { /* the strip just keeps its last numbers */ }
+}
+function startStatus() {
+  stopStatus();
+  pollStatus();
+  app.statusTimer = setInterval(pollStatus, STATUS_EVERY_MS);
+}
+function stopStatus() {
+  if (app.statusTimer) clearInterval(app.statusTimer);
+  app.statusTimer = null;
 }
 
 /* ------------------------------------------------------------------- speaking */
@@ -377,16 +719,19 @@ function onTurnMessage(message) {
   switch (message.type) {
     case "transcript":
       addLine("you", message.text); app.replyOpen = false; break;
+    case "tool":
+      addCard(message); app.replyOpen = false; buzz(8); break;
     case "sentence":
       appendReply(message.text); speak(message.text); break;
     case "done":
-      app.busy = false; app.replyOpen = false; say("");
-      if (message.error) addLine("err", message.error);
+      app.busy = false; app.replyOpen = false; say(""); ui.send.disabled = false;
+      if (message.error) { addLine("err", message.error); buzz([30, 40, 30]); } else { buzz([10, 30, 10]); }
+      pollStatus();
       break;
     case "busy":
-      app.busy = false; say(message.message || "Busy."); break;
+      app.busy = false; ui.send.disabled = false; say(message.message || "Busy."); break;
     case "error":
-      app.busy = false; addLine("err", message.message || "Something went wrong."); say(""); break;
+      app.busy = false; ui.send.disabled = false; addLine("err", message.message || "Something went wrong."); say(""); buzz(40); break;
     case "unpaired":
       showPairing("Pair this phone again."); break;
     default:
@@ -419,7 +764,7 @@ async function startListening() {
       positiveSpeechThreshold: 0.6,
       minSpeechFrames: 4,
       redemptionFrames: 12,
-      onSpeechStart: () => { say("listening"); },
+      onSpeechStart: () => { say("hearing you"); },
       onVADMisfire: () => { say("that was too short, sir"); },
       onSpeechEnd: (audio) => { sendUtterance(audio); }
     });
@@ -427,7 +772,7 @@ async function startListening() {
   app.vad.start();
   app.armed = true;
   ui.talk.dataset.armed = "1";
-  ui.talk.textContent = "listening";
+  render();
   say("speak when ready");
   return true;
 }
@@ -436,7 +781,7 @@ function stopListening(message) {
   if (app.vad) { try { app.vad.pause(); } catch (err) { /* ignore */ } }
   app.armed = false;
   ui.talk.dataset.armed = "0";
-  ui.talk.textContent = "tap to talk";
+  render();
   say(message || "");
 }
 
@@ -447,7 +792,24 @@ function sendUtterance(samples) {
   app.busy = true;
   say("sent " + (samples.length / 16000).toFixed(1) + " seconds");
   socket.send(toPcm16(samples));
+  buzz(12);
   stopListening("");
+}
+
+/* Typed turns go down the same socket as a JSON frame; the desk answers with the
+   same sentences and cards, so the page cannot tell the two apart. */
+async function sendText(text) {
+  const clean = String(text || "").trim();
+  if (!clean) return;
+  let socket;
+  try { socket = await connectAudio(); } catch (err) { addLine("err", "I couldn't reach the desk."); return; }
+  app.busy = true;
+  app.replyOpen = false;
+  addLine("you", clean);
+  ui.send.disabled = true;
+  say("sent");
+  socket.send(JSON.stringify({ type: "say", text: clean }));
+  buzz(8);
 }
 
 /* ----------------------------------------------------------------- the button */
@@ -462,6 +824,7 @@ ui.talk.addEventListener("click", async () => {
     if (app.audioCtx.state === "suspended") app.audioCtx.resume();
   } catch (err) { /* a context is a nicety; the VAD makes its own too */ }
   primeSpeech();
+  buzz(10);
 
   if (app.armed) { stopListening(""); return; }
   ui.talk.disabled = true;
@@ -475,21 +838,33 @@ ui.talk.addEventListener("click", async () => {
   }
 });
 
+ui.composer.addEventListener("submit", (event) => {
+  event.preventDefault();
+  primeSpeech();
+  const text = ui.text.value;
+  ui.text.value = "";
+  sendText(text);
+});
+
 /* ---------------------------------------------------------------- the routines */
 function drawRoutines(routines) {
   ui.routines.textContent = "";
   (routines || []).forEach((routine) => {
     const button = document.createElement("button");
+    button.type = "button";
     button.textContent = routine.name;
     button.addEventListener("click", async () => {
       primeSpeech();
+      buzz(10);
       button.disabled = true;
+      addLine("you", routine.name);
       try {
         const answer = await api("/api/routine", { name: routine.name });
         if (answer.status === 401) { showPairing("Pair this phone again."); return; }
         if (answer.data.said) { appendReply(answer.data.said); speak(answer.data.said); }
         if (!answer.data.ok && !answer.data.said) addLine("err", "That routine did not run.");
         app.replyOpen = false;
+        pollStatus();
       } catch (err) {
         addLine("err", "I couldn't reach the desk.");
       } finally {
@@ -510,6 +885,8 @@ ui.forget.addEventListener("click", async () => {
 
 /* ------------------------------------------------------------------- pairing */
 function showPairing(message) {
+  app.paired = false;
+  stopStatus();
   ui.pair.hidden = false;
   ui.forget.hidden = true;
   ui.pairNote.textContent = message || "";
@@ -533,9 +910,11 @@ ui.pairGo.addEventListener("click", async () => {
     if (answer.data.ok) {
       ui.pair.hidden = true;
       ui.code.value = "";
+      buzz([10, 30, 10]);
       await boot();
     } else {
       ui.pairNote.textContent = answer.data.message || "Pairing failed.";
+      buzz(40);
     }
   } catch (err) {
     ui.pairNote.textContent = "The desk did not answer.";
@@ -549,11 +928,13 @@ async function boot() {
   try {
     const answer = await api("/api/session");
     if (!answer.data.paired) { showPairing(""); setLink(false, "not paired"); return; }
+    app.paired = true;
     ui.pair.hidden = true;
     ui.forget.hidden = false;
     setState(answer.data.state);
     drawRoutines(answer.data.routines);
     connectState();
+    startStatus();
   } catch (err) {
     setLink(false, "offline");
     say("The desk did not answer.");
@@ -565,6 +946,7 @@ async function boot() {
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     app.suspended = true;
+    stopStatus();
     stopListening("");
     [app.stateWs, app.audioWs].forEach((socket) => {
       try { if (socket) socket.close(); } catch (err) { /* ignore */ }
