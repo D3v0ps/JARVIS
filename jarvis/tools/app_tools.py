@@ -14,6 +14,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import webbrowser
@@ -198,27 +199,66 @@ def open_app(ctx: ToolContext, args: dict) -> ToolResult:
 
     apps = _apps(ctx)
     match = resolve_app(spoken, apps)
+
+    # A configured value that is a URI or a real file is authoritative: the user put
+    # it there on purpose.
+    if match is not None:
+        key, target = match
+        if target.startswith(_URI_PREFIXES) or Path(target).is_file():
+            return _launched(key, target, _start(target))
+
+    # Otherwise ask Windows what it actually has. `start spotify` only works for
+    # something on the PATH, which most applications are not - and it exits zero
+    # anyway while showing "Windows cannot find 'spotify'", so the old path reported
+    # success for a launch that never happened.
+    from jarvis.tools import windows_apps  # noqa: PLC0415 - Windows-only helper
+
+    for candidate in _candidates(spoken, match, apps):
+        resolved = windows_apps.resolve(candidate)
+        if resolved is None:
+            continue
+        try:
+            how = resolved.launch()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("Could not launch %r: %s", resolved.target, exc)
+            continue
+        return _launched(resolved.label, resolved.target, how)
+
+    # Last resort: the configured target, or the raw name, through the shell.
     key, target = match if match is not None else (spoken, spoken)
     label = friendly_name(key)
+    if shutil.which(target) or (match is not None and target != spoken):
+        try:
+            return _launched(label, target, _start(target))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("Could not open %r (target %r): %s", spoken, target, exc)
 
-    try:
-        how = _start(target)
-    except Exception as exc:  # noqa: BLE001 - every launch failure ends in one sentence
-        _log.warning("Could not open %r (target %r): %s", spoken, target, exc)
-        detail = f"target={target!r} error={type(exc).__name__}: {exc}"
-        if match is None:
-            known = [friendly_name(str(key)) for key in list(apps)[:2]]
-            hint = f", though I do have {' and '.join(known)}" if known else ""
-            return ToolResult.fail(
-                f"I couldn't find {label} on this machine{hint}, sir.", detail=detail
-            )
-        return ToolResult.fail(f"I couldn't open {label}, sir.", detail=detail)
+    known = [name for name, _ in windows_apps.start_apps()[:2]]
+    hint = f" I do have {' and '.join(known)}." if known else ""
+    return ToolResult.fail(
+        f"I can't find {label} on this machine, sir.{hint}",
+        detail=f"tried target={target!r}; Start menu had no match for {spoken!r}",
+    )
 
+
+def _candidates(spoken: str, match, apps) -> list[str]:
+    """Names worth asking Windows about, best first."""
+    names = [spoken]
+    if match is not None:
+        key, target = match
+        for extra in (friendly_name(key), str(key), Path(target).stem):
+            if extra and extra.lower() not in {name.lower() for name in names}:
+                names.append(extra)
+    return names
+
+
+def _launched(label: str, target: str, how: str) -> ToolResult:
+    friendly = friendly_name(label)
     return ToolResult(
         ok=True,
-        summary=f"Opening {label}, sir.",
+        summary=f"{friendly} is open, sir.",
         detail=f"Launched {target!r} via {how}.",
-        data={"app": key, "target": target, "method": how},
+        data={"app": label, "target": target, "method": how},
     )
 
 

@@ -126,6 +126,16 @@ def build(
     from jarvis.tools.dispatcher import Dispatcher
 
     registry.load_all()
+
+    # Asking Windows for its Start menu takes the better part of a second; do it now
+    # so the first "open Spotify" does not pay for it.
+    try:
+        from jarvis.tools import windows_apps
+
+        windows_apps.prewarm()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Could not pre-warm the application list: %s", exc)
+
     ctx = ToolContext(
         config=cfg, memory=memory, logger=get_logger("tools"),
         speak=speak, confirm=confirm, notify=notify,
