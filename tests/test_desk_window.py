@@ -7,22 +7,28 @@ lookup seams, and the questions asked of it are the ones a broken installation w
 ask - is the order right, does a forced mode stay forced, does a missing host fall
 through rather than raise, and does the operator's own Edge profile stay untouched.
 
-The one behaviour worth naming: closing the window hides it. If that veto ever stops
-working, the close button silently ends the window for the rest of the session and
-the tray has nothing left to bring back.
+Three behaviours are worth naming. Closing the window hides it - if that veto ever
+stops working, the close button silently ends the window for the rest of the session
+and the tray has nothing left to bring back. The page is not a drag handle: with
+``easy_drag`` on, no text anywhere can be selected and every slider moves the window
+instead of itself. And because a frameless window has no resize border of its own,
+:meth:`DeskWindow.resize` is the only thing standing between the operator and a size
+he can never change.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
 
 from jarvis.desk import window as window_mod
-from jarvis.desk.window import CHAIN, DeskWindow
+from jarvis.desk.window import CHAIN, MIN_SIZE, DeskWindow
 
 URL = "http://127.0.0.1:53535/?t=ticket"
 EDGE_EXE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
@@ -48,6 +54,15 @@ class FakeEvents:
         self.closing = FakeEvent()
         self.moved = FakeEvent()
         self.resized = FakeEvent()
+        self.shown = FakeEvent()
+
+
+class FakeForm:
+    """The WinForms form behind a pywebview window. All we want of it is its icon."""
+
+    def __init__(self) -> None:
+        # WinForms' own spelling of the property, not ours.
+        self.Icon: Any = None
 
 
 class FakeWindow:
@@ -56,6 +71,10 @@ class FakeWindow:
         self.kwargs = kwargs
         self.events = FakeEvents()
         self.calls: list[str] = []
+        #: pywebview keys its native instances by this.
+        self.uid = "master"
+        self.size: tuple[int, int] | None = None
+        self.resize_error: Exception | None = None
 
     def show(self) -> None:
         self.calls.append("show")
@@ -66,6 +85,21 @@ class FakeWindow:
     def destroy(self) -> None:
         self.calls.append("destroy")
 
+    def resize(self, width: int, height: int) -> None:
+        if self.resize_error is not None:
+            raise self.resize_error
+        self.size = (width, height)
+        self.calls.append("resize")
+
+    def maximize(self) -> None:
+        self.calls.append("maximize")
+
+    def restore(self) -> None:
+        self.calls.append("restore")
+
+    def minimize(self) -> None:
+        self.calls.append("minimize")
+
 
 class FakeWebview:
     """The ``webview`` module with the GUI taken out of it."""
@@ -74,6 +108,11 @@ class FakeWebview:
         self.windows: list[FakeWindow] = []
         self.started = 0
         self.error: Exception | None = None
+        #: What pywebview reports about the desk this window is standing on.
+        self.screens = [SimpleNamespace(width=1920, height=1080)]
+        #: ``webview.gui.BrowserView.instances`` - empty until the loop draws a form.
+        self.forms: dict[str, FakeForm] = {}
+        self.gui = SimpleNamespace(BrowserView=SimpleNamespace(instances=self.forms))
 
     def create_window(self, title: str, **kwargs: Any) -> FakeWindow:
         if self.error is not None:
@@ -81,6 +120,12 @@ class FakeWebview:
         made = FakeWindow(title, **kwargs)
         self.windows.append(made)
         return made
+
+    def draw(self, window: FakeWindow) -> FakeForm:
+        """What the GUI loop does once it has a real form: this is when an icon lands."""
+        form = FakeForm()
+        self.forms[window.uid] = form
+        return form
 
     def start(self, *args: Any, **kwargs: Any) -> None:
         self.started += 1
@@ -174,9 +219,9 @@ def make_window(desk_config, hosts):
     """Builds windows and closes them afterwards, whatever the test did to them."""
     built: list[DeskWindow] = []
 
-    def build(**kwargs: Any) -> DeskWindow:
+    def build(url: Any = URL, **kwargs: Any) -> DeskWindow:
         made = DeskWindow(
-            desk_config, URL, logger=logging.getLogger("jarvis.test.desk"), **kwargs
+            desk_config, url, logger=logging.getLogger("jarvis.test.desk"), **kwargs
         )
         built.append(made)
         return made
@@ -354,6 +399,43 @@ def test_only_the_webview_host_needs_the_main_thread(make_window, hosts):
     assert edge_window.needs_main_thread is False
 
 
+def test_a_window_asked_for_off_the_main_thread_falls_through_to_edge(make_window, hosts):
+    """A WebView2 window can only be built on the thread that owns the message pump.
+
+    The tray's "Open JARVIS" runs on the tray's own thread, and so does anything
+    the page asks for over the socket. Claiming success there and opening the window
+    later is a promise with nothing behind it: the operator clicks, nothing appears,
+    and the window reports that it is up. Edge needs no such thread, so Edge gets it.
+    """
+    window = make_window()
+    answer: list[bool] = []
+    worker = threading.Thread(target=lambda: answer.append(window.start()))
+
+    worker.start()
+    worker.join(5.0)
+
+    assert answer == [True]
+    assert window.backend == "edge"
+    assert hosts.webview is not None and hosts.webview.windows == []
+
+
+def test_a_forced_webview_window_off_the_main_thread_fails_rather_than_lying(
+    make_window, desk_config, hosts
+):
+    """With no rung to fall to, the honest answer is False - not a window that never comes."""
+    desk_config.set("ui.window_mode", "webview")
+    window = make_window()
+    answer: list[bool] = []
+    worker = threading.Thread(target=lambda: answer.append(window.start()))
+
+    worker.start()
+    worker.join(5.0)
+
+    assert answer == [False]
+    assert window.backend == "none"
+    assert hosts.launched == [] and hosts.opened == []
+
+
 def test_run_enters_the_pywebview_loop_and_returns_at_once_for_any_other_host(
     make_window, hosts
 ):
@@ -372,9 +454,7 @@ def test_run_enters_the_pywebview_loop_and_returns_at_once_for_any_other_host(
 
 
 # --- the pywebview window itself --------------------------------------------------------
-def test_the_window_is_frameless_draggable_and_on_the_desks_own_background(
-    make_window, hosts
-):
+def test_the_window_is_frameless_and_on_the_desks_own_background(make_window, hosts):
     """Windows chrome around a page with its own title bar would be two title bars."""
     window = make_window()
     window.start()
@@ -384,10 +464,47 @@ def test_the_window_is_frameless_draggable_and_on_the_desks_own_background(
     assert opened.title == "J.A.R.V.I.S."
     assert opened.kwargs["url"] == URL
     assert opened.kwargs["frameless"] is True
-    assert opened.kwargs["easy_drag"] is True
     assert opened.kwargs["resizable"] is True
     assert opened.kwargs["background_color"] == "#05080c"
-    assert opened.kwargs["min_size"] == (640, 480)
+    assert opened.kwargs["min_size"] == MIN_SIZE
+
+
+def test_the_whole_page_is_not_a_window_drag_handle(make_window, hosts):
+    """``easy_drag`` makes every pixel of the page a title bar, which breaks the page.
+
+    With it on, no text anywhere can be selected - not an answer, not a phone number
+    off a card - and dragging the voice-speed slider moves the window rather than the
+    slider. The page already marks its own title bar with ``.pywebview-drag-region``,
+    which pywebview's customize.js registers separately and which keeps working
+    without this flag; that is precisely what the page's own comment assumes.
+    """
+    window = make_window()
+    window.start()
+
+    assert hosts.webview is not None
+    assert hosts.webview.windows[0].kwargs["easy_drag"] is False
+
+
+def test_the_advertised_minimum_size_is_one_the_page_can_actually_render(
+    make_window, desk_config, hosts
+):
+    """A minimum that collapses the two columns over each other is not a minimum.
+
+    The window happily opens at whatever the config says, so a floor of 640x480 was a
+    promise that the page renders at 640x480 - it does not - and the operator meets it
+    the first time he drags the grip as far as it will go.
+    """
+    # 900, not 860: the page's one-column breakpoint is max-width 899px, and a window
+    # that cannot show both columns at its own minimum is a window with a wrong minimum.
+    assert MIN_SIZE == (900, 620)
+
+    desk_config.set("ui.window_size", [700, 500])
+    window = make_window()
+    window.start()
+
+    assert hosts.webview is not None
+    kwargs = hosts.webview.windows[0].kwargs
+    assert (kwargs["width"], kwargs["height"]) == MIN_SIZE
 
 
 def test_the_window_opens_where_and_how_big_the_config_remembers(
@@ -581,3 +698,251 @@ def test_every_control_is_a_harmless_no_op_when_there_is_no_window(make_window, 
     assert (window.show(), window.hide(), window.toggle()) == (False, False, False)
     window.run()
     window.stop()
+
+
+# --- resizing a window the operating system will not resize -------------------------------
+def test_the_page_can_resize_the_frameless_window_because_nothing_else_can(
+    make_window, hosts
+):
+    """``frameless=True`` takes the resize border away and pywebview gives none back.
+
+    Without this call the remembered size can be written but never changed, and every
+    height and width the page's layout responds to is unreachable for the life of the
+    window. The grip in the page's corner is the only grip there is.
+    """
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+
+    assert window.resize(1100, 800) is True
+    assert hosts.webview.windows[0].size == (1100, 800)
+
+
+def test_a_resize_is_clamped_to_the_minimum_size_and_to_the_screen(make_window, hosts):
+    """A grip dragged past the edge of the desk means "as big as you go", not a crash."""
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+    opened = hosts.webview.windows[0]
+
+    assert window.resize(10, 10) is True
+    assert opened.size == MIN_SIZE
+
+    assert window.resize(99999, 99999) is True
+    assert opened.size == (1920, 1080), "the screen pywebview reported"
+
+
+def test_a_resize_from_the_page_is_remembered_as_a_dragged_border_would_be(
+    make_window, desk_config, hosts
+):
+    """The remembered-size machinery was unreachable while nothing could change the size."""
+    window = make_window()
+    window._save_delay = 0.01
+    window.start()
+
+    assert window.resize(1024, 768) is True
+
+    assert wait_for(lambda: desk_config.get("ui.window_size") == [1024, 768])
+
+
+def test_a_size_the_page_could_not_have_sent_is_refused_rather_than_guessed_at(
+    make_window, hosts
+):
+    """Nonsense means the frame did not come from our page, and is worth nothing."""
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+
+    assert window.resize("wide", None) is False
+    assert hosts.webview.windows[0].size is None
+
+
+def test_a_window_that_will_not_resize_says_so_instead_of_raising(make_window, hosts):
+    """This is called off a websocket frame; a traceback there would take the reader down."""
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+    hosts.webview.windows[0].resize_error = RuntimeError("the form has gone")
+
+    assert window.resize(1000, 700) is False
+
+
+@pytest.mark.parametrize("verb", ("maximize", "restore", "minimize"))
+def test_the_title_bars_own_buttons_reach_the_native_window(make_window, hosts, verb):
+    """The page draws those buttons, so this is the whole of what happens when one is hit."""
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+
+    assert getattr(window, verb)() is True
+    assert verb in hosts.webview.windows[0].calls
+
+
+@pytest.mark.parametrize("verb", ("resize", "maximize", "restore", "minimize"))
+def test_every_window_verb_is_a_harmless_no_op_without_a_window_of_our_own(
+    make_window, hosts, verb
+):
+    """Edge and a browser tab wear the same page, buttons and all, around someone else's frame."""
+    hosts.webview = None
+    window = make_window()
+    window.start()
+    assert window.backend == "edge"
+
+    call = getattr(window, verb)
+    assert (call(900, 700) if verb == "resize" else call()) is False
+
+
+def test_a_pywebview_too_old_to_maximise_reports_that_it_could_not(
+    make_window, hosts, monkeypatch
+):
+    """An older pywebview is a dead button, never a traceback into the socket reader."""
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+    monkeypatch.setattr(hosts.webview.windows[0], "maximize", None)
+
+    assert window.maximize() is False
+
+
+# --- a second opening ---------------------------------------------------------------------
+def test_opening_again_after_the_browser_fallback_opens_the_page_again(make_window, hosts):
+    """A tab is not a handle: nothing here can raise it, so opening means opening.
+
+    The tray's "Open JARVIS" would otherwise be inert for the rest of the session
+    on every machine with neither WebView2 nor Edge - it would be told the window is
+    already up, by a backend that is holding nothing at all.
+    """
+    hosts.webview = None
+    hosts.edge_exe = None
+    window = make_window()
+    assert window.start() is True
+    assert window.backend == "browser"
+
+    assert window.start() is True
+
+    assert hosts.opened == [URL, URL]
+
+
+def test_a_second_opening_of_a_real_window_does_not_build_a_second_one(make_window, hosts):
+    """Where there is a handle, show() is the cheap answer and start() must not rebuild."""
+    window = make_window()
+    assert window.start() is True
+
+    assert window.start() is True
+
+    assert hosts.webview is not None and len(hosts.webview.windows) == 1
+
+
+# --- the ticket in the URL -----------------------------------------------------------------
+def test_every_opening_asks_for_the_url_again_so_a_spent_ticket_is_never_offered_twice(
+    make_window, hosts
+):
+    """The desk's ticket is single-use, so a URL captured when the window was built is dead.
+
+    Cached, the second opening of the window is refused by our own front door with
+    "this link has already been used", which is the assistant telling the operator his
+    own link is no good.
+    """
+    tickets = iter(("one", "two", "three"))
+    hosts.webview = None
+    hosts.edge_exe = None
+    window = make_window(url=lambda: f"http://127.0.0.1:53535/?t={next(tickets)}")
+
+    assert window.start() is True
+    assert window.start() is True
+
+    assert hosts.opened == [
+        "http://127.0.0.1:53535/?t=one",
+        "http://127.0.0.1:53535/?t=two",
+    ]
+
+
+def test_relaunching_edge_asks_for_a_fresh_url_as_well(make_window, hosts):
+    """``show()`` after the operator closed Edge is a new process, so it needs a new ticket."""
+    tickets = iter(("one", "two"))
+    hosts.webview = None
+    window = make_window(url=lambda: f"http://127.0.0.1:53535/?t={next(tickets)}")
+    window.start()
+    hosts.launched[0].close_yourself()
+
+    assert window.show() is True
+
+    assert "--app=http://127.0.0.1:53535/?t=one" in hosts.launched[0].command
+    assert "--app=http://127.0.0.1:53535/?t=two" in hosts.launched[1].command
+
+
+def test_a_server_that_will_not_give_a_url_costs_the_window_and_nothing_else(
+    make_window, hosts
+):
+    """The desk server stopping must end in False and a log line, as every failure here does."""
+
+    def gone() -> str:
+        raise RuntimeError("the desk server has stopped")
+
+    window = make_window(url=gone)
+
+    assert window.start() is False
+    assert window.backend == "none"
+    assert hosts.launched == [] and hosts.opened == []
+
+
+# --- the icon on the taskbar ----------------------------------------------------------------
+def test_the_window_wears_the_reactor_once_its_form_exists(
+    make_window, desk_config, hosts, monkeypatch
+):
+    """Otherwise the taskbar and Alt-Tab advertise Python, which is a different application."""
+    icon_file = Path(desk_config.path).resolve().parent / "assets" / "jarvis.ico"
+    icon_file.parent.mkdir(parents=True, exist_ok=True)
+    icon_file.write_bytes(b"\x00\x00\x01\x00")
+    made = object()
+    asked: list[Path] = []
+    monkeypatch.setattr(
+        window_mod, "load_icon", lambda path: (asked.append(path), made)[1]
+    )
+
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+    opened = hosts.webview.windows[0]
+    form = hosts.webview.draw(opened)  # what the GUI loop does before it shows the window
+
+    opened.events.shown.fire()
+
+    assert form.Icon is made
+    assert asked[-1] == icon_file
+
+
+def test_a_form_that_the_loop_has_not_drawn_yet_is_left_entirely_alone(
+    make_window, desk_config, hosts, monkeypatch
+):
+    """``start()`` runs before pywebview has built anything native; it must not mind."""
+    icon_file = Path(desk_config.path).resolve().parent / "assets" / "jarvis.ico"
+    icon_file.parent.mkdir(parents=True, exist_ok=True)
+    icon_file.write_bytes(b"\x00\x00\x01\x00")
+    monkeypatch.setattr(window_mod, "load_icon", lambda path: object())
+
+    window = make_window()
+
+    assert window.start() is True
+    assert hosts.webview is not None and hosts.webview.forms == {}
+
+
+def test_an_icon_that_was_never_generated_leaves_the_default_one_in_place(
+    make_window, hosts, monkeypatch
+):
+    """A source tree without ``assets/jarvis.ico`` is a plainer window, never a broken one."""
+    asked: list[Path] = []
+    monkeypatch.setattr(
+        window_mod, "load_icon", lambda path: (asked.append(path), object())[1]
+    )
+
+    window = make_window()
+    window.start()
+    assert hosts.webview is not None
+    opened = hosts.webview.windows[0]
+    form = hosts.webview.draw(opened)
+
+    opened.events.shown.fire()
+
+    assert asked == [], "there is no icon file to read"
+    assert form.Icon is None

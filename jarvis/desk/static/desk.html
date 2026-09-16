@@ -28,6 +28,12 @@
       content="default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:;
                style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';
                font-src 'self'; base-uri 'none'; form-action 'none'">
+<!-- The reactor itself, inline and below the policy that governs it. A window in
+     Edge's app mode gets a tab icon whether we provide one or not, and the one it
+     invents is a grey globe. It is encoded into the document rather than filed
+     beside it so that the page stays one file, and a data: URI is precisely what
+     the img-src above allows. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='50' fill='%2305080c'/%3E%3Ccircle cx='50' cy='50' r='29.05' fill='none' stroke='%2329b6f6' stroke-width='11.9' stroke-dasharray='18.25 4.56'/%3E%3Ccircle cx='50' cy='50' r='37.2' fill='none' stroke='%2329b6f6' stroke-width='2.4'/%3E%3Ccircle cx='50' cy='50' r='19.1' fill='none' stroke='%2329b6f6' stroke-width='2.6'/%3E%3Ccircle cx='50' cy='50' r='9' fill='%23ffffff'/%3E%3C/svg%3E">
 <style>
   /* The phone's palette, unchanged: idle blue, listening cyan, thinking amber,
      speaking teal, on near-black. One product, two windows. */
@@ -48,6 +54,15 @@
     --ring: 196px;
     --mono: "Cascadia Mono", Consolas, ui-monospace, SFMono-Regular, monospace;
     --bar: 36px;
+  }
+  /* A short window must give something up, and the reactor is the most decorative
+     thing on the page: it shrinks so that the conversation, the working line and the
+     composer keep their heights. 860x620 is the smallest the native window goes, and
+     at 620 the second of these is already in force. */
+  @media (max-height: 700px) { :root { --ring: 140px; } }
+  @media (max-height: 560px) {
+    :root { --ring: 108px; }
+    .caption { font-size: 10px; letter-spacing: 0.24em; }
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -72,8 +87,11 @@
   input, textarea { user-select: text; -webkit-user-select: text; }
   button { font: inherit; color: inherit; cursor: pointer; background: none; border: 0; }
   ::-webkit-scrollbar { width: 9px; height: 9px; }
-  ::-webkit-scrollbar-thumb { background: rgba(41,182,246,0.16); border-radius: 9px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(41,182,246,0.3); }
+  /* Visible enough to read as a scrollbar. At 0.16 on this background the thumb is
+     invisible, and content that has scrolled off then looks like content that was
+     never drawn - which is the one thing a window of evidence may not do. */
+  ::-webkit-scrollbar-thumb { background: rgba(41,182,246,0.38); border-radius: 9px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(41,182,246,0.55); }
   ::-webkit-scrollbar-track { background: transparent; }
 
   /* --- our own title bar --------------------------------------------------- */
@@ -100,6 +118,18 @@
   .winbtn:hover { background: rgba(41,182,246,0.14); color: var(--ink); }
   .winbtn.close:hover { background: rgba(255,111,96,0.22); color: #ffe2de; }
 
+  /* --- the resize grip ------------------------------------------------------ */
+  /* A frameless pywebview window has no resize border of the system's own, so the
+     corner is ours to draw and ours to report. It sits outside the drag region for
+     the same reason the window buttons do: pywebview drags by anything inside it. */
+  #grip {
+    position: fixed; right: 0; bottom: 0; z-index: 6; width: 20px; height: 20px;
+    display: grid; place-items: center; cursor: nwse-resize; touch-action: none;
+    color: rgba(41,182,246,0.34); transition: color .15s ease;
+  }
+  #grip:hover, #grip.dragging { color: rgba(41,182,246,0.8); }
+  #grip svg { width: 15px; height: 15px; }
+
   /* --- the confirmation bar ------------------------------------------------- */
   #confirm {
     position: relative; z-index: 2; flex: 0 0 auto; overflow: hidden;
@@ -120,7 +150,12 @@
   #confirm .what { flex: 1 1 auto; min-width: 0; }
   #confirmText { font-size: 15px; color: #ffe9bd; }
   #confirm .cue { font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: rgba(255,233,189,0.55); }
-  #confirmLeft { font: 500 13px/1 var(--mono); color: var(--thinking); font-variant-numeric: tabular-nums; }
+  /* Fixed width and never wrapped: at 880px the bar is tight, and a countdown that
+     breaks across two lines takes the Cancel button down with it. */
+  #confirmLeft {
+    flex: 0 0 auto; white-space: nowrap;
+    font: 500 13px/1 var(--mono); color: var(--thinking); font-variant-numeric: tabular-nums;
+  }
   #confirmFuse { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--thinking); width: 100%; }
   .btn {
     padding: 9px 18px; border-radius: 10px; font-size: 14px; letter-spacing: 0.04em;
@@ -147,11 +182,20 @@
   }
 
   .theatre { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  /* Faded at both ends, like the feed: the fade is what says "there is more of this
+     above" on a column whose scrollbar is nine pixels wide. */
   .instruments {
     display: flex; flex-direction: column; gap: 9px; min-height: 0; overflow-y: auto; padding-right: 2px;
-    mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
-    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+    mask-image: linear-gradient(to bottom, transparent, #000 12px, #000 calc(100% - 14px), transparent);
+    -webkit-mask-image: linear-gradient(to bottom, transparent, #000 12px, #000 calc(100% - 14px), transparent);
   }
+  /* The panel that takes up the slack in a tall window, so the column does not end
+     halfway down with 250px of nothing under it. The pending work is the right one
+     to grow: empty space inside a bordered panel reads as a list with room in it,
+     while the same space with no panel round it reads as a page that failed. */
+  .instruments .fill { flex: 1 1 auto; min-height: 96px; display: flex; flex-direction: column; }
+  .instruments .fill #timers { flex: 1 1 auto; }
+  .instruments .fill #timers .empty { margin: auto; }
 
   .panel {
     flex: 0 0 auto;
@@ -217,7 +261,14 @@
     color: var(--accent); transition: color .3s;
   }
   .under { display: flex; align-items: center; gap: 10px; min-height: 22px; margin-top: 3px; }
-  .note { font-size: 12.5px; color: var(--thinking); text-align: center; max-width: 420px; }
+  /* Dim, like the phone's: most of what lands here is ordinary narration - opening
+     a page, dialling a number - and painting that in the warning colour teaches the
+     operator to ignore the one line that is ever going to matter. .bad is for the
+     line that does. */
+  .note { font-size: 12.5px; color: var(--dim); text-align: center; max-width: 420px; }
+  .note.bad { color: var(--thinking); }
+  /* With nothing to say it takes no room at all, so HALT keeps the reactor's axis. */
+  .note:empty { display: none; }
   #halt {
     display: none; padding: 3px 11px; border-radius: 11px; font-size: 11px; letter-spacing: 0.16em;
     text-transform: uppercase; color: var(--dim); border: 1px solid rgba(255,255,255,0.09);
@@ -226,15 +277,23 @@
   body[data-state="thinking"] #halt, body[data-state="speaking"] #halt { display: block; }
 
   /* the working line: heard -> thinking -> tools -> answer -> latency */
-  /* It wraps rather than scrolls: a turn you cannot see the beginning of is not a
-     record of the turn. Two rows hold a long one; beyond that it scrolls down. */
+  /* It wraps rather than scrolls, and it is never scrolled for you: what was heard
+     is the one step that makes the rest of the row mean anything, so it stays where
+     it is and a fourth row is allowed to fall off the bottom behind a fade. Three
+     rows hold every turn with fewer than about six tools in it. */
   #work {
     flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: safe center;
-    column-gap: 15px; row-gap: 5px; max-height: 76px;
+    column-gap: 15px; row-gap: 5px; max-height: 116px;
     margin: 0 0 8px; padding: 11px 2px 2px; border-top: 1px solid rgba(255,255,255,0.05);
     overflow-x: hidden; overflow-y: auto; scrollbar-width: none;
   }
   #work::-webkit-scrollbar { display: none; }
+  /* Only when there is genuinely more below, or the fade would dim a row that is
+     whole and tell the operator a lie about it. */
+  #work.more {
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 22px), transparent);
+  }
   .step {
     position: relative; flex: 0 0 auto; display: flex; align-items: baseline; gap: 7px; max-width: 330px;
     padding: 5px 11px; border-radius: 11px; border: 1px solid rgba(255,255,255,0.06);
@@ -260,18 +319,33 @@
   @keyframes pulse { 0%,100% { opacity: .62 } 50% { opacity: 1 } }
 
   /* the feed */
+  /* Bottom-anchored. A top-anchored feed puts one exchange at the top of a column
+     450px tall and leaves the rest of it as a hole above the composer; this way the
+     newest line always sits just above the box you would type the next one into.
+
+     Anchored with an auto margin on the first line and NOT with justify-content:
+     flex-end, which is the obvious way to write it and is a trap. Overflow in a
+     flex-end column goes off the *top* of the scroll box, where scrollTop cannot
+     reach it: measured in this engine, forty lines gave scrollHeight === clientHeight
+     and a first line sitting at -1624px, permanently out of sight. An auto margin
+     resolves to zero the moment the free space turns negative, so a short
+     conversation is pushed down and a long one scrolls the whole way back. */
   #feed {
     flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 4px 8px 2px;
     display: flex; flex-direction: column; gap: 8px;
     mask-image: linear-gradient(to bottom, transparent, #000 16px);
     -webkit-mask-image: linear-gradient(to bottom, transparent, #000 16px);
   }
-  /* At the top rather than dead centre: the space below then reads as room for the
-     conversation to grow into, which is what it is. */
+  #feed > :first-child { margin-top: auto; }
+  /* The invitation is the exception: with nothing said yet there is no conversation
+     to sit above, so it takes the middle of the empty column. */
   #feed:empty::before {
     content: "Say Hey JARVIS, click the reactor, or type below.";
-    margin: 16px auto auto; font-size: 13px; color: var(--dim); text-align: center;
+    margin: auto; font-size: 13px; color: var(--dim); text-align: center;
   }
+  /* cursor: text as well as user-select - the window's own cursor is an arrow, and
+     an arrow over a paragraph says "do not bother trying to copy this". */
+  .line, .card, .lg { cursor: text; }
   .line { padding: 9px 13px; border-radius: 15px; max-width: 78%; font-size: 14.5px; user-select: text; }
   .line.you { align-self: flex-end; background: rgba(41,182,246,0.14); border: 1px solid var(--edge); border-bottom-right-radius: 5px; }
   .line.him { align-self: flex-start; background: var(--panel); border: 1px solid rgba(255,255,255,0.05); border-bottom-left-radius: 5px; }
@@ -332,7 +406,9 @@
   .tile .s { font-size: 10px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #tModel .v { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tile.hot .v { color: var(--thinking); }
-  .tile.live .v { color: var(--speaking); }
+  /* The same token as the phone's .stat.live: --speaking is the colour of "he is
+     talking", and a busy GPU is not that. */
+  .tile.live .v { color: var(--listening); }
 
   #timers { display: flex; flex-direction: column; gap: 6px; }
   .job { display: flex; align-items: center; gap: 9px; padding: 5px 4px 5px 8px; border-radius: 10px; background: rgba(8,15,21,0.5); }
@@ -343,7 +419,13 @@
   .job.going { opacity: .45; }
   .empty { font-size: 12.5px; color: var(--dim); }
 
-  #routines { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+  /* The row scrolls, and a pill sliced by a hard edge reads as a broken layout rather
+     than as "there is more to the right". The fade says which it is. */
+  #routines {
+    display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none;
+    mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+  }
   #routines::-webkit-scrollbar { display: none; }
   #routines button { flex: 0 0 auto; white-space: nowrap; }
   #routines button {
@@ -391,12 +473,21 @@
   #send:hover { background: rgba(41,182,246,0.3); }
   #send:disabled { opacity: .4; }
   #send svg { width: 18px; height: 18px; }
+  /* One row, always. The facts are furniture and may be cut short; the log button
+     and the problems filter are controls, and a control that has wrapped onto a
+     second line at 880px has moved the composer up and the drawer off the window. */
   .facts {
-    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 14px; flex-wrap: nowrap; min-width: 0;
     margin-top: 8px; font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim);
   }
+  .facts .fact {
+    flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .facts .fact b { font-weight: 500; color: rgba(216,236,247,0.72); letter-spacing: 0.06em; }
-  .facts .sp { flex: 1 1 auto; }
+  .facts .sp { flex: 0 0 0; }
+  .facts .controls-right {
+    flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; gap: 14px;
+  }
   #drawerToggle { font-size: 10.5px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--dim); }
   #drawerToggle:hover { color: var(--ink); }
   #drawerToggle .badge { color: var(--bad); font-family: var(--mono); letter-spacing: 0; }
@@ -421,13 +512,16 @@
 <body data-state="idle">
 
 <header id="bar">
-  <div class="drag pywebview-drag-region">
+  <div id="drag" class="drag pywebview-drag-region">
     <span class="mark">J.A.R.V.I.S.</span>
     <span class="link"><span id="dot" class="dot"></span><span id="linkText">offline</span></span>
   </div>
   <div class="winbtns nodrag">
     <button id="min" class="winbtn nodrag" type="button" title="Minimise" aria-label="Minimise">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 8.5h10"/></svg>
+    </button>
+    <button id="maxi" class="winbtn nodrag" type="button" title="Maximise or restore" aria-label="Maximise or restore">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3.7" y="3.7" width="8.6" height="8.6" rx="1.3"/></svg>
     </button>
     <button id="close" class="winbtn close nodrag" type="button"
             title="Close to the tray. I shall still be listening, sir." aria-label="Close to the tray">
@@ -527,7 +621,7 @@
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel fill">
       <h2>Timers and reminders</h2>
       <div id="timers"><div class="empty">Nothing pending.</div></div>
     </section>
@@ -567,11 +661,21 @@
   </form>
   <div class="facts" id="facts">
     <span class="sp"></span>
-    <button id="onlyProblems" type="button" data-on="0" title="Show warnings and errors only">problems only</button>
-    <button id="drawerToggle" type="button" aria-expanded="false">log</button>
+    <span class="controls-right">
+      <button id="onlyProblems" type="button" data-on="0" title="Show warnings and errors only">problems only</button>
+      <button id="drawerToggle" type="button" aria-expanded="false">log</button>
+    </span>
   </div>
   <div id="drawer" hidden><div id="logLines"></div></div>
 </footer>
+
+<!-- The window's own resize corner. Three hairlines, because that is what a resize
+     corner has looked like since before any of us were at a desk. -->
+<div id="grip" class="nodrag" title="Drag to resize the window">
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+    <path d="M14.6 5.4L5.4 14.6"/><path d="M14.6 9.6L9.6 14.6"/><path d="M14.6 13.8L13.8 14.6"/>
+  </svg>
+</div>
 
 <script>
 "use strict";
@@ -592,7 +696,8 @@ const ui = {
   drawerToggle: el("drawerToggle"), onlyProblems: el("onlyProblems"),
   confirm: el("confirm"), confirmText: el("confirmText"), confirmLeft: el("confirmLeft"),
   confirmFuse: el("confirmFuse"), confirmYes: el("confirmYes"), confirmNo: el("confirmNo"),
-  min: el("min"), close: el("close")
+  min: el("min"), maxi: el("maxi"), close: el("close"),
+  drag: el("drag"), grip: el("grip")
 };
 
 const app = {
@@ -604,7 +709,9 @@ const app = {
   replyOpen: false,
   timersKey: "",       // the timer list is only rebuilt when it actually changes
   problems: 0,
-  quitArmed: null
+  quitArmed: null,
+  maximized: false,  // what the page last asked for; nothing tells it the truth
+  grip: null         // the resize drag in progress, if there is one
 };
 
 const CAPTIONS = {
@@ -625,10 +732,27 @@ function clip(text, limit) {
   const clean = String(text || "").trim();
   return clean.length > limit ? clean.slice(0, limit - 1) + "…" : clean;
 }
+/* Which box is the one that scrolls depends on how wide the window is, and that is
+   the whole of this problem. At a desk width #feed overflows and setting its
+   scrollTop works; narrow the window past 899px and #feed is simply as tall as its
+   contents while <main> is the box with the overflow, so the same assignment moves
+   nothing at all and his answer lands below the fold and stays there. Walk up until
+   something can genuinely be scrolled, then scroll it - and when that something is
+   not the feed, scroll the newest line into view rather than scrolling to the very
+   bottom, which in one column is the instruments. */
+function scrollFeed() {
+  const newest = ui.feed.lastElementChild;
+  let box = ui.feed;
+  while (box && box.scrollHeight - box.clientHeight <= 1) box = box.parentElement;
+  if (!box || box === document.documentElement) return;
+  if (box === ui.feed || !newest) { box.scrollTop = box.scrollHeight; return; }
+  const over = newest.getBoundingClientRect().bottom - box.getBoundingClientRect().bottom;
+  if (over > 0) box.scrollTop += over + 10;
+}
 function post(element) {
   ui.feed.appendChild(element);
   while (ui.feed.children.length > MAX_FEED) ui.feed.removeChild(ui.feed.firstChild);
-  ui.feed.scrollTop = ui.feed.scrollHeight;
+  scrollFeed();
   return element;
 }
 function addLine(kind, text) {
@@ -641,15 +765,20 @@ function appendReply(text) {
   if (last && last.classList.contains("card") && last.dataset.summary === text) return;
   if (app.replyOpen && last && last.classList.contains("him")) {
     last.textContent = (last.textContent + " " + text).trim();
-    ui.feed.scrollTop = ui.feed.scrollHeight;
+    scrollFeed();
   } else {
     addLine("him", text);
     app.replyOpen = true;
   }
 }
-/* The note line is for things that went wrong, not for narration: the reactor and
-   the working line already say what he is doing. */
-function notice(text) { ui.note.textContent = text || ""; }
+/* Two registers, one line. Most of what arrives here is narration - "Dialling,
+   sir.", "Opening that in your browser, sir." - and narration is dim, exactly as the
+   same sentence is on the phone. The amber is reserved for the note frame and for a
+   verb that did not happen, so that when it does appear it still means something. */
+function notice(text, bad) {
+  ui.note.textContent = text || "";
+  ui.note.classList.toggle("bad", !!text && !!bad);
+}
 
 /* ------------------------------------------------------------------- the wire */
 function wsUrl(path) {
@@ -666,14 +795,14 @@ function setLink(up, text) {
 function send(frame) {
   const socket = app.ws;
   if (!socket || socket.readyState !== 1) {
-    notice("I have lost the link to myself, sir.");
+    notice("I have lost the link to myself, sir.", true);
     return false;
   }
   try {
     socket.send(JSON.stringify(frame));
     return true;
   } catch (err) {
-    notice("That did not reach me, sir.");
+    notice("That did not reach me, sir.", true);
     return false;
   }
 }
@@ -719,13 +848,27 @@ function onDeskMessage(message) {
     case "confirm":      showConfirm(message.announcement, message.seconds); break;
     case "confirm_done": hideConfirm(!!message.granted); break;
     case "latency":      onLatency(message.ms, message.marks); break;
-    case "note":         notice(message.text); break;
+    case "note":         notice(message.text, true); break;
     case "log":          onLog(message); break;
     case "status":       drawStatus(message); break;
-    case "error":        notice(message.message || "Something went wrong, sir."); break;
-    case "busy":         notice(message.message || "I am in the middle of something, sir."); break;
-    default:             break; /* ping, ack, closed: nothing to draw */
+    case "ack":          onAck(message); break;
+    case "error":        notice(message.message || "Something went wrong, sir.", true); break;
+    case "busy":         notice(message.message || "I am in the middle of something, sir.", true); break;
+    default:             break; /* ping, closed: nothing to draw */
   }
+}
+
+/* An acknowledgement that worked is silent - the state, the working line and the
+   feed are already saying so. One that did not has to be spoken, because the only
+   other evidence of it is nothing happening, which is indistinguishable from a
+   window that has quietly stopped listening. */
+const ACK_REFUSED = {
+  listen: "I am in the middle of something, sir.",
+  confirm: "There is nothing waiting, sir."
+};
+function onAck(message) {
+  if (message.ok !== false) return;
+  notice(ACK_REFUSED[String(message.for || "")] || "I could not do that, sir.", true);
 }
 
 /* hello is also the page's reset. The server replays the conversation right
@@ -812,7 +955,14 @@ function drawWork() {
     badge.title = marksText(turn.marks) || "End of speech to the first audio out.";
     ui.work.appendChild(badge);
   }
-  ui.work.scrollTop = ui.work.scrollHeight;
+  /* Deliberately not scrolled to the bottom. Scrolling took the heard step off the
+     top of a three-row line, which left a sliced row of pills describing a question
+     nobody could see. It stays where it is, and a turn too long for three rows says
+     so with a fade instead. */
+  ui.work.classList.toggle("more", ui.work.scrollHeight - ui.work.clientHeight > 1);
+  /* A step added here is a step the feed below has just been pushed down by, which
+     in the one-column layout is enough to put his answer behind the composer. */
+  scrollFeed();
 }
 
 function onHeard(text) {
@@ -866,8 +1016,13 @@ function clock(epoch) {
   const when = new Date(Number(epoch) * 1000);
   return isNaN(when.getTime()) ? "" : when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
+/* "--:--" rather than "NaN:NaN". A card whose due time never arrived is a card that
+   does not know when the timer ends, and saying so is the honest answer; arithmetic
+   on undefined is not. */
 function countdown(epoch) {
-  const left = Math.max(0, Math.round(Number(epoch) - Date.now() / 1000));
+  const at = Number(epoch);
+  if (!isFinite(at)) return "--:--";
+  const left = Math.max(0, Math.round(at - Date.now() / 1000));
   const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), s = left % 60;
   const two = (n) => String(n).padStart(2, "0");
   return h > 0 ? h + ":" + two(m) + ":" + two(s) : two(m) + ":" + two(s);
@@ -902,7 +1057,9 @@ function businessBody(d, body, actions) {
   if (d.address) body.appendChild(node("div", "card-sub", d.address));
   if (d.opening_hours) body.appendChild(node("div", "card-sub", d.opening_hours));
   if (d.phone) {
-    const call = node("button", "primary", "Ring " + d.phone);
+    /* "Call", not "Ring": the phone shipped this button first and one product does
+       not use two words for one verb depending on which window you are looking at. */
+    const call = node("button", "primary", "Call " + d.phone);
     call.type = "button";
     call.addEventListener("click", () => ask("call " + d.phone, "Dialling, sir."));
     actions.appendChild(call);
@@ -938,6 +1095,10 @@ function cardBody(ev, body, actions) {
       }
       return false;
     case "set_timer": {
+      /* The one field this card exists to show. Without it there is nothing to draw
+         but a dash, so the card falls back to what he actually said - which is the
+         whole of the answer anyway. */
+      if (!isFinite(Number(d.due))) return false;
       body.appendChild(node("div", "card-sub", d.label || "Timer"));
       const big = node("div", "card-big", countdown(d.due));
       big.dataset.due = String(d.due || "");
@@ -1034,7 +1195,10 @@ function fillCard(card, ev) {
   card.className = "card" + (status === "done" ? "" : " " + status);
   card.lastElementChild.remove();                       /* the empty running body */
   const chip = card.querySelector(".chip");
-  chip.textContent = status + (ev.ms ? " · " + ev.ms + " ms" : "");
+  /* The assistant sends this as a float and the phone's reporter sends it rounded.
+     Nobody wants to read 641.8271000003 ms off a chip, so it is rounded here. */
+  const ms = Math.round(Number(ev.ms)) || 0;
+  chip.textContent = status + (ms ? " · " + ms + " ms" : "");
   const body = node("div", "card-body");
   const actions = node("div", "card-actions");
   const drawn = status === "done" && cardBody(ev, body, actions);
@@ -1044,7 +1208,7 @@ function fillCard(card, ev) {
   }
   card.appendChild(body);
   if (actions.childElementCount) card.appendChild(actions);
-  ui.feed.scrollTop = ui.feed.scrollHeight;
+  scrollFeed();
   return card;
 }
 function onTool(ev) {
@@ -1060,7 +1224,7 @@ function onTool(ev) {
   for (let i = app.turn.tools.length - 1; i >= 0; i--) {
     const tool = app.turn.tools[i];
     if (tool.name === name && !tool.done) {
-      tool.done = true; tool.ok = !!ev.ok && !ev.refused; tool.ms = Number(ev.ms) || 0;
+      tool.done = true; tool.ok = !!ev.ok && !ev.refused; tool.ms = Math.round(Number(ev.ms)) || 0;
       break;
     }
   }
@@ -1224,6 +1388,9 @@ function showConfirm(announcement, seconds) {
     ui.confirmFuse.style.transition = "width " + span + "s linear";
     ui.confirmFuse.style.width = "0%";
   });
+  /* The bar is 90-odd pixels the feed below it has just lost, which is enough to
+     put what he last said behind the composer. */
+  scrollFeed();
   /* Cancel takes the focus, never Confirm. This bar appears for the tools that
      delete files and shut the machine down, and the key a startled operator hits
      is Enter or Space - which must land on the harmless one. */
@@ -1240,6 +1407,7 @@ function hideConfirm(granted) {
   ui.confirm.hidden = true;
   delete ui.confirmLeft.dataset.count;
   addLine("sys", granted ? "confirmed" : "stood down");
+  scrollFeed();
 }
 ui.confirmYes.addEventListener("click", () => answerConfirm(true));
 ui.confirmNo.addEventListener("click", () => answerConfirm(false));
@@ -1273,6 +1441,7 @@ ui.drawerToggle.addEventListener("click", () => {
     app.problems = 0;
     ui.drawer.scrollTop = ui.drawer.scrollHeight;
   }
+  scrollFeed();                    /* the drawer took its height out of the feed */
   drawDrawerLabel();
 });
 ui.onlyProblems.addEventListener("click", () => {
@@ -1333,6 +1502,65 @@ ui.close.addEventListener("click", () => {
     try { window.close(); } catch (err) { /* a browser tab we may not close */ }
   }
 });
+
+/* Nothing ever tells the page whether the native window is maximised, so it
+   remembers what it last asked for. The worst that can happen is one click that
+   does nothing because something else restored the window, and the next one is
+   right again - which is cheaper than a frame the contract does not have. */
+function toggleMaximize() {
+  const next = !app.maximized;
+  if (send({ type: "window", action: next ? "maximize" : "restore" })) app.maximized = next;
+}
+ui.maxi.addEventListener("click", toggleMaximize);
+/* Double-clicking the title bar is what every other window on the machine does. */
+ui.drag.addEventListener("dblclick", toggleMaximize);
+
+/* -------------------------------------------------------------- the resize grip */
+/* A frameless pywebview window has no resize border of the system's own, so without
+   this corner the window is stuck at whatever size it was given. What is sent is the
+   size the window should now be: where the pointer started, where it is, and how big
+   the window was when the drag began. The server clamps it, and only one frame goes
+   out per animation frame - a pointer moves a great deal more often than a window
+   can usefully be resized. */
+function gripSend() {
+  const grip = app.grip;
+  if (!grip) return;
+  grip.queued = false;
+  send({
+    type: "window", action: "resize",
+    width: Math.round(grip.w + (grip.x - grip.x0)),
+    height: Math.round(grip.h + (grip.y - grip.y0))
+  });
+}
+ui.grip.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  app.grip = {
+    x0: event.screenX, y0: event.screenY, x: event.screenX, y: event.screenY,
+    w: window.outerWidth || window.innerWidth,
+    h: window.outerHeight || window.innerHeight,
+    queued: false
+  };
+  ui.grip.classList.add("dragging");
+  try { ui.grip.setPointerCapture(event.pointerId); } catch (err) { /* older engines */ }
+});
+ui.grip.addEventListener("pointermove", (event) => {
+  const grip = app.grip;
+  if (!grip) return;
+  grip.x = event.screenX;
+  grip.y = event.screenY;
+  if (grip.queued) return;
+  grip.queued = true;
+  requestAnimationFrame(gripSend);
+});
+function gripEnd(event) {
+  if (!app.grip) return;
+  if (app.grip.queued) gripSend();     /* the last move, if one is still waiting */
+  app.grip = null;
+  ui.grip.classList.remove("dragging");
+  try { ui.grip.releasePointerCapture(event.pointerId); } catch (err) { /* already gone */ }
+}
+ui.grip.addEventListener("pointerup", gripEnd);
+ui.grip.addEventListener("pointercancel", gripEnd);
 
 /* Every countdown on screen - the cards, the timer list, the confirmation fuse -
    ticks from this one interval rather than one timer each. */

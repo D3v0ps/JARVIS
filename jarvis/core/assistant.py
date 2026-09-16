@@ -49,6 +49,30 @@ DESK_SETTINGS: frozenset[str] = frozenset({
     "ui.always_on_top",
 })
 
+def safe_card_data(data: Any) -> dict:
+    """Only the keys a face is already trusted with, and only if they render.
+
+    The desk has full rights over what JARVIS may *do*; that is not a reason to post a
+    tool's raw output into a web page, where the card renderer would draw it. The
+    allowlist is the phone's own, imported rather than restated, because a second copy
+    is a second thing to remember when a tool grows a field. No list, no card data.
+    """
+    if not isinstance(data, dict):
+        return {}
+    try:
+        from jarvis.remote.session import ToolReporter
+
+        allowed = ToolReporter.SAFE_DATA_KEYS
+    except Exception:  # noqa: BLE001 - without the list, nothing is known to be safe
+        _fan_log.debug("The safe-key list is unavailable; the card goes out empty.")
+        return {}
+    return {
+        key: value
+        for key, value in data.items()
+        if key in allowed and isinstance(value, (str, int, float, bool, list))
+    }
+
+
 #: A button press has no words, and the confirmation path downstream reads words.
 #: These two are what a click is written down as, and both survive ``is_confirmation``.
 CONFIRM_WORD = "confirm"
@@ -60,6 +84,17 @@ class _Mode(Enum):
     LISTENING = "listening"
     WORKING = "working"
     CONFIRMING = "confirming"
+
+
+#: What the ring should say for each mode. A guarded confirmation interrupts whatever
+#: the loop was doing and has to hand both the mode *and* the state back afterwards,
+#: and the two disagreeing is how the ring ends up thinking he is still busy.
+_STATE_FOR_MODE: dict[_Mode, AssistantState] = {
+    _Mode.IDLE: AssistantState.IDLE,
+    _Mode.LISTENING: AssistantState.LISTENING,
+    _Mode.WORKING: AssistantState.THINKING,
+    _Mode.CONFIRMING: AssistantState.THINKING,
+}
 
 
 class Assistant:
@@ -79,11 +114,24 @@ class Assistant:
         self._worker: threading.Thread | None = None
         self._work: "queue.Queue[np.ndarray | None]" = queue.Queue(maxsize=2)
 
-        self._confirm_reply: str | None = None
-        self._confirm_ready = threading.Event()
+        # Only one guarded tool may ask at a time. A routine frame runs its calls on
+        # the socket's reader thread and can reach a GUARDED tool while the worker
+        # thread is already waiting for an answer; two confirmation bars at once is
+        # not a state the window can express, so the second one queues behind the first.
+        self._confirm_gate = threading.Lock()
         # The spoken answer and the window's button race for the same slot; the lock
         # is what makes "first one wins" true rather than nearly true.
         self._confirm_lock = threading.Lock()
+        #: Every confirmation is minted with an id of its own, so an answer that
+        #: arrives late cannot be applied to whichever tool happens to be asking now.
+        self._confirm_seq = 0
+        self._confirm_id = 0
+        self._confirm_reply: str | None = None
+        self._confirm_ready: threading.Event | None = None
+        #: Set from the window's thread, read by the ear's. Waking up touches the
+        #: microphone, the segmenter and the wake word, all of which belong to the
+        #: capture loop, so the crossing is a flag - exactly as _stop_turn is.
+        self._arm_request = threading.Event()
         self._barge_frames = 0
 
         self.conversation_timeout = float(cfg.get("assistant.conversation_timeout", 20) or 20)
@@ -331,6 +379,15 @@ class Assistant:
 
     def _route(self, frame: np.ndarray) -> None:
         self._report_level(frame)
+
+        # The window asked for the microphone from its own thread; wake up here, where
+        # the mic, the segmenter and the detector are all ours to touch.
+        if self._arm_request.is_set():
+            self._arm_request.clear()
+            if self._mode is _Mode.IDLE:
+                self._on_wake()
+                return
+            self.log.debug("The armed microphone arrived while %s; ignored.", self._mode.value)
 
         if self._mode is _Mode.IDLE:
             wake = self.parts.wake
@@ -668,6 +725,11 @@ class Assistant:
         The same call the ear makes, rather than a second copy of it: the chime, the
         acknowledgement and the follow-up window all belong to waking up, and a button
         that only did some of that would be a different thing wearing the same name.
+
+        It is *asked for* rather than done here, because this runs on the websocket
+        reader thread and waking up flushes the microphone, resets the segmenter and
+        resets the wake word - three objects the capture loop is using at that instant.
+        The next frame turns the flag into the wake the ear would have made itself.
         """
         if self.text_mode:
             return False
@@ -678,7 +740,7 @@ class Assistant:
             self.log.info("The window asked me to listen while %s.", self._mode.value)
             return False
         self.log.info("The window armed the microphone.")
-        self._on_wake()
+        self._arm_request.set()
         return True
 
     def abort_turn(self) -> None:
@@ -691,13 +753,19 @@ class Assistant:
         self.log.info("The turn was stopped from the window.")
 
     def answer_confirmation(self, granted: bool) -> bool:
-        """Answer a waiting GUARDED tool with a click. False when nothing is waiting."""
-        if self._mode is not _Mode.CONFIRMING:
-            self.log.info("The window answered a confirmation nobody was waiting for.")
-            return False
+        """Answer a waiting GUARDED tool with a click. False when nothing is waiting.
+
+        The mode and the pending id are read under the same lock the answer is written
+        with: between a check taken outside it and a write made inside it, the tool
+        that was asking can have timed out and a second one taken its place.
+        """
         word = CONFIRM_WORD if granted else CANCEL_WORD
-        if not self._settle_confirmation(word, source="the window"):
-            return False
+        with self._confirm_lock:
+            if self._mode is not _Mode.CONFIRMING or not self._confirm_id:
+                self.log.info("The window answered a confirmation nobody was waiting for.")
+                return False
+            if not self._settle_locked(word, source="the window"):
+                return False
         self.log.info("The window %s the confirmation.", "granted" if granted else "refused")
         return True
 
@@ -730,19 +798,47 @@ class Assistant:
         return said
 
     def apply_setting(self, key: str, value: Any) -> bool:
-        """Change one allowlisted key, write it to config.yaml, and apply it now if cheap."""
+        """Change one allowlisted key, write it to config.yaml, and apply it now if cheap.
+
+        The key and the value go through the same door. A face allowed to set
+        ``tts.speed`` is not thereby allowed to set it to ``"quickly"``, to ``NaN`` or
+        to forty, and the table that knows the difference is the desk server's -
+        imported rather than copied, because two allowlists drift the day one is edited.
+        """
         name = str(key or "").strip()
         if name not in DESK_SETTINGS:
             self.log.warning("Refusing to set %r from a face: it is not on the list.", name)
             return False
         try:
-            self.cfg.set(name, value)
-            self.cfg.save()
+            from jarvis.desk.server import SETTINGS
+        except Exception as exc:  # noqa: BLE001 - no desk package means no window either
+            self.log.warning(
+                "Refusing to set %s: the desk's value table is unavailable (%s).", name, exc
+            )
+            return False
+        rule = SETTINGS.get(name)
+        if rule is None:
+            self.log.warning("Refusing to set %s: the desk has no shape for it.", name)
+            return False
+        try:
+            checked = rule(value)
+        except (TypeError, ValueError) as exc:
+            self.log.warning("Refusing %r for %s: %s", value, name, exc)
+            return False
+        try:
+            self.cfg.set(name, checked)
+            saved = self.cfg.save()
         except Exception as exc:  # noqa: BLE001 - a read-only config file is not a crash
             self.log.warning("Could not save %s: %s", name, exc)
             return False
-        self._apply_setting_now(name, value)
-        self.log.info("%s is now %r.", name, value)
+        if saved is False:
+            # Config.save reports a file it could not write by returning False. Telling
+            # the window a slider was saved when it was not is the kind of lie that ends
+            # with the operator moving it three times and restarting.
+            self.log.warning("%s could not be written to config.yaml.", name)
+            return False
+        self._apply_setting_now(name, checked)
+        self.log.info("%s is now %r.", name, checked)
         return True
 
     def show_window(self) -> None:
@@ -840,7 +936,15 @@ class Assistant:
                 unsubscribe()
             except Exception as exc:  # noqa: BLE001
                 self.log.debug("The state bus had already let the window go: %s", exc)
-        self._desk_bus = None
+        # Closed last, and only once nothing can still publish into it: a bus left open
+        # keeps every subscriber's queue alive, and the page reads that as a live
+        # server and reconnects to it for the rest of the machine's day.
+        bus, self._desk_bus = self._desk_bus, None
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+                self.log.debug("The window's bus would not close: %s", exc)
 
     def _desk_publish(self, kind: str, **payload: Any) -> None:
         """Tell the window something the HUD interface has no word for."""
@@ -854,7 +958,19 @@ class Assistant:
 
     # --- guarded confirmation ----------------------------------------------------------
     def _tool_confirm(self, announcement: str) -> bool:
-        """Say what is about to happen, then wait to be told to go ahead."""
+        """Say what is about to happen, then wait to be told to go ahead.
+
+        Serialised: a desk routine walks its tool calls on the websocket's reader
+        thread, so a second GUARDED tool can reach here while the worker thread is
+        still waiting for an answer to the first. Sharing one slot meant one spoken
+        "confirm" granted both of them, and the window cannot draw two confirmation
+        bars in any case, so the second question waits for the first to be answered.
+        """
+        with self._confirm_gate:
+            return self._confirm_once(announcement)
+
+    def _confirm_once(self, announcement: str) -> bool:
+        """One question, asked and answered, with the gate already held."""
         self._say_in_character(announcement)
         if self.text_mode:
             return self._confirm_by_typing(announcement)
@@ -863,12 +979,15 @@ class Assistant:
             self._hud.note = "Say confirm"
             self._hud.touch()
 
-        self._confirm_reply = None
-        self._confirm_ready.clear()
         self.parts.speaker.wait(timeout=20)
         self.parts.mic.flush()
         self.parts.segmenter.reset()
-        self._mode = _Mode.CONFIRMING
+        # Whatever the loop was doing before the question, it goes back to afterwards.
+        # A microphone turn is already WORKING, but a typed desk turn, a routine or a
+        # timer firing may be IDLE or LISTENING, and hard-coding WORKING on the way
+        # out left the ear watching for barge-in and the wake word unread for ever.
+        previous = self._mode
+        token, ready = self._open_confirmation()
         self.state.set(AssistantState.LISTENING)
         # Published only once the mode is set, so the bar the window draws and the
         # button on it become live at the same moment.
@@ -891,15 +1010,15 @@ class Assistant:
         pulser = threading.Thread(target=pulse, name="jarvis-awaiting", daemon=True)
         pulser.start()
 
+        answered = ready.wait(timeout=self.confirmation_timeout)
+        waiting.set()
+        reply = self._close_confirmation(token, previous)
         granted = False
-        if self._confirm_ready.wait(timeout=self.confirmation_timeout):
-            reply = (self._confirm_reply or "").strip()
+        if answered:
             log_transcript("user", reply)
             granted = is_confirmation(reply) and not is_cancellation(reply)
 
-        waiting.set()
-        self._mode = _Mode.WORKING
-        self.state.set(AssistantState.THINKING)
+        self.state.set(_STATE_FOR_MODE.get(previous, AssistantState.THINKING))
         self._desk_publish("confirm_done", granted=granted)
         if self._hud is not None:
             self._hud.note = "" if granted else "cancelled"
@@ -925,6 +1044,39 @@ class Assistant:
             reply = ""
         self._settle_confirmation(reply, source="the microphone")
 
+    def _open_confirmation(self) -> tuple[int, threading.Event]:
+        """Mint a confirmation of its own and go into CONFIRMING with it.
+
+        The id is what keeps two guarded tools apart. An answer is written into the
+        slot that is open at the moment it lands, and the tool that asked reads back
+        only the answer that was given to *its* id - so a "confirm" shouted at one
+        question can never be the thing that runs another.
+        """
+        with self._confirm_lock:
+            self._confirm_seq += 1
+            self._confirm_id = self._confirm_seq
+            self._confirm_reply = None
+            self._confirm_ready = threading.Event()
+            self._mode = _Mode.CONFIRMING
+            return self._confirm_id, self._confirm_ready
+
+    def _close_confirmation(self, token: int, previous: _Mode) -> str:
+        """Retire ``token``'s slot, restore the mode it interrupted, return its answer.
+
+        Empty when nobody answered, and empty as well when the slot has already moved
+        on - which cannot happen while the gate is held, and is the honest answer if
+        it ever does.
+        """
+        with self._confirm_lock:
+            if self._confirm_id != token:
+                return ""
+            reply = self._confirm_reply
+            self._confirm_id = 0
+            self._confirm_reply = None
+            self._confirm_ready = None
+            self._mode = previous
+        return (reply or "").strip()
+
     def _settle_confirmation(self, reply: str, *, source: str) -> bool:
         """Write down the first answer to arrive. False means somebody else was first.
 
@@ -933,11 +1085,19 @@ class Assistant:
         the operator had already changed his mind about.
         """
         with self._confirm_lock:
-            if self._confirm_ready.is_set():
-                self.log.debug("A confirmation from %s arrived second; ignored.", source)
-                return False
-            self._confirm_reply = reply
-            self._confirm_ready.set()
+            return self._settle_locked(reply, source=source)
+
+    def _settle_locked(self, reply: str, *, source: str) -> bool:
+        """:meth:`_settle_confirmation` with ``_confirm_lock`` already held."""
+        pending, ready = self._confirm_id, self._confirm_ready
+        if not pending or ready is None:
+            self.log.debug("A confirmation from %s arrived with nothing pending.", source)
+            return False
+        if ready.is_set():
+            self.log.debug("A confirmation from %s arrived second; ignored.", source)
+            return False
+        self._confirm_reply = reply
+        ready.set()
         return True
 
     # --- speaking ----------------------------------------------------------------------
@@ -1103,13 +1263,26 @@ class _HudFan:
         return event
 
     def tool_finished(
-        self, name: str, *, ok: bool, duration_ms: float, refused: bool = False
+        self,
+        name: str,
+        *,
+        ok: bool,
+        duration_ms: float,
+        refused: bool = False,
+        summary: str = "",
+        data: Any = None,
     ) -> None:
+        """The overlay's signature, plus the two fields a card is made of.
+
+        Both are keyword-only and both default, because ``HudModel`` has neither and
+        the same call site writes to whichever of the two this session built. The ring
+        never sees them - it has no room for a card - so they are not forwarded.
+        """
         if self._hud is not None:
             self._hud.tool_finished(name, ok=ok, duration_ms=duration_ms, refused=refused)
         self._publish(
             "tool", name=str(name), phase="end", ok=bool(ok), refused=bool(refused),
-            ms=float(duration_ms),
+            ms=float(duration_ms), summary=str(summary or ""), data=safe_card_data(data),
         )
 
     def touch(self) -> None:
@@ -1147,11 +1320,22 @@ class _HudDispatcher:
         started = time.perf_counter()
         result = self._inner.execute(name, args)
         if self._hud is not None:
+            # What the tool actually found is the whole of a card, and this is the only
+            # call site that still holds the result. Offered to the fan alone: HudModel's
+            # signature is the overlay's, and widening it for a face it cannot draw would
+            # be the wrong file to change.
+            extra: dict[str, Any] = {}
+            if isinstance(self._hud, _HudFan):
+                extra = {
+                    "summary": str(getattr(result, "summary", "") or ""),
+                    "data": getattr(result, "data", None),
+                }
             self._hud.tool_finished(
                 name,
                 ok=bool(getattr(result, "ok", False)),
                 duration_ms=(time.perf_counter() - started) * 1000.0,
                 refused=bool(getattr(result, "refused", False)),
+                **extra,
             )
         return result
 

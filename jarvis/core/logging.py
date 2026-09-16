@@ -30,10 +30,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
 
 __all__ = [
     "setup_logging", "get_logger", "log_transcript", "log_tool_call",
-    "log_refusal", "log_latency", "LOGGER_NAME",
+    "log_refusal", "log_latency", "LOGGER_NAME", "NULL_STREAM_FLAG",
 ]
 
 LOGGER_NAME = "jarvis"
+
+#: Attribute that marks a stream opened on the null device because Windows gave the
+#: process none. ``jarvis/__main__`` tags the sinks it installs with it; without the
+#: tag a sink that swallows everything is indistinguishable from a working console.
+NULL_STREAM_FLAG = "_jarvis_null_stream"
 
 # Defaults mirror the `logging:` section of the shipped config.yaml.
 DEFAULT_LOG_FILE = "logs/jarvis.log"
@@ -196,17 +201,26 @@ def _console_stream() -> Any:
     that case, but a ``StreamHandler`` wrapped around ``None`` raises on every single
     record, which would turn a silent start into a storm of handler errors. Returning
     ``None`` lets the callers leave the console handler out altogether.
+
+    By the time this runs, ``jarvis/__main__`` has usually put handles on the null
+    device in place of those ``None`` streams, so third-party code does not trip over
+    them either — which makes ``sys.stdout`` look perfectly usable again. Those sinks
+    carry :data:`NULL_STREAM_FLAG` and are skipped here: a handler over the null device
+    is not a console, it is every record thrown away twice as expensively.
     """
-    stream = sys.stdout if sys.stdout is not None else sys.stderr
-    if stream is None or not callable(getattr(stream, "write", None)):
-        return None
-    reconfigure = getattr(stream, "reconfigure", None)
-    if callable(reconfigure):
-        try:
-            reconfigure(errors="replace")
-        except Exception:
-            logging.getLogger(LOGGER_NAME).debug("Console stream does not support reconfigure()", exc_info=True)
-    return stream
+    for candidate in (sys.stdout, sys.stderr):
+        if candidate is None or getattr(candidate, NULL_STREAM_FLAG, False):
+            continue
+        if not callable(getattr(candidate, "write", None)):
+            continue
+        reconfigure = getattr(candidate, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                logging.getLogger(LOGGER_NAME).debug("Console stream does not support reconfigure()", exc_info=True)
+        return candidate
+    return None
 
 
 def _use_color(cfg: "Config | Mapping[str, Any] | None", stream: Any) -> bool:

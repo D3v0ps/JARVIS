@@ -329,7 +329,8 @@ def build_desk(
     with nothing at all.
 
     The window is built even when it is not opened at start, because the ticket in the
-    server's URL is minted once and expires; the tray's ``Open the console`` opens the
+    server's URL is minted per open, because its ticket is single-use; the tray's
+    ``Open JARVIS`` opens the
     window that was made here rather than inventing a second door.
     """
     if not cfg.get("ui.window", True):
@@ -351,13 +352,89 @@ def build_desk(
     try:
         from jarvis.desk import DeskWindow
 
-        window = DeskWindow(cfg, server.url, logger=get_logger("desk.window"))
-        if cfg.get("ui.open_window_on_start", True) and not window.start():
+        window = DeskWindow(
+            # A callable, never the string: the ticket in the URL is single-use and
+            # expires, so a link captured here is worthless by the time the tray opens
+            # the window an hour later. Every open asks the server for a fresh one.
+            cfg, lambda: server.url,
+            logger=get_logger("desk.window"),
+            on_close=lambda: _window_closed(assistant, logger),
+        )
+        if _should_open_now(cfg, window, logger) and not window.start():
             logger.info("The desk window is served, but nothing here would host it.")
     except Exception as exc:  # noqa: BLE001
         logger.info("The desk window could not be opened: %s", exc)
         window = None
+    if window is not None:
+        _attach_window(server, window, logger)
     return server, window
+
+
+def _attach_window(server: Any, window: Any, logger: logging.Logger) -> None:
+    """Let the server reach the window, for the frames that show and hide it.
+
+    The page's own title bar has a minimise and a close, and both of those are the
+    window's business rather than the assistant's; the server is the only thing the
+    page can talk to, so it is the thing that has to hold the reference.
+    """
+    attach = getattr(server, "attach_window", None)
+    if not callable(attach):
+        logger.debug("This DeskServer takes no window; the page's title bar will be inert.")
+        return
+    try:
+        attach(window)
+    except Exception as exc:  # noqa: BLE001 - a face is never worth the start-up
+        logger.debug("The desk server would not take the window: %s", exc)
+
+
+def _window_closed(assistant: Any, logger: logging.Logger) -> None:
+    """The operator closed the window. It hid into the tray rather than quitting.
+
+    Anyone who has just clicked the X has no way of knowing that, so the tray's menu is
+    redrawn and one line goes to the log. This is also the hook the tray grows into the
+    day it wants to say anything more than "Open JARVIS".
+    """
+    logger.info("The window has gone to the tray, sir; I am still listening.")
+    tray = getattr(assistant, "tray", None)
+    state = getattr(assistant, "state", None)
+    if tray is None or state is None:
+        return
+    try:
+        tray.on_state(state.state)
+    except Exception as exc:  # noqa: BLE001 - the tray is decoration, always
+        logger.debug("The tray would not take the news: %s", exc)
+
+
+def _should_open_now(cfg: Config, window: Any, logger: logging.Logger) -> bool:
+    """Whether to host the page at start-up. ``open_window_on_start`` decides, mostly.
+
+    The exception is WebView2. pywebview can only create a window on the main thread,
+    and by the time the tray's ``Open JARVIS`` is clicked the main thread is
+    already inside ``run_forever``. With ``open_window_on_start: false`` on a machine
+    where pywebview wins the chain, the tray's menu item would therefore never be able
+    to open anything at all - so the window is created now and the operator is told
+    why, which is the smaller of the two surprises.
+    """
+    if cfg.get("ui.open_window_on_start", True):
+        return True
+    if _winning_host(window) != "webview":
+        return False
+    logger.info(
+        "WebView2 hosts the window here and can only be created on the main thread, "
+        "so it opens now despite ui.open_window_on_start; set ui.window_mode to edge "
+        "to have it wait in the tray instead."
+    )
+    return True
+
+
+def _winning_host(window: Any) -> str:
+    """Which host would take the page, asked without opening anything. ``none`` if unsure."""
+    try:
+        order = window._order()
+        probe = window._probe
+        return next((name for name in order if probe(name)), "none")
+    except Exception:  # noqa: BLE001 - an unanswerable question is a no
+        return "none"
 
 
 # --- choosing a model that is actually there -------------------------------------------

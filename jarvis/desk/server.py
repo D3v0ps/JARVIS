@@ -13,7 +13,8 @@ almost entirely door:
   that is not a loopback literal is refused rather than quietly obeyed;
 * the URL carries a single-use ticket that is exchanged for a session cookie and
   burned, so the copy of it left in Edge's command line and in the process list is
-  worthless a moment later, and worthless anyway after two minutes;
+  worthless a moment later, and worthless anyway after two minutes. Opening the
+  window again mints a new one rather than reviving the old;
 * every request must come from a loopback peer, address this server by its own
   ``Host``, and — if it volunteers an ``Origin`` at all — volunteer ours. That is the
   DNS-rebinding defence: a page on the open web that resolves ``evil.example`` to
@@ -46,10 +47,14 @@ __all__ = [
     "COOKIE_NAME",
     "DeskServer",
     "LOCKED_OUT_HTML",
+    "MAX_FIELD",
     "MAX_SAY",
+    "REFUSAL_INTERVAL",
     "SETTINGS",
     "STATUS_INTERVAL",
     "TICKET_TTL",
+    "WINDOW_ACTIONS",
+    "WINDOW_BOUNDS",
 ]
 
 #: The session cookie. Deliberately not the phone's name: the two doors are separate.
@@ -64,6 +69,22 @@ MAX_SAY = 2000
 #: Seconds between telemetry readings while at least one window is watching.
 STATUS_INTERVAL = 2.0
 
+#: How often a burst of refusals may put a single line above DEBUG in the log.
+REFUSAL_INTERVAL = 60.0
+
+#: The longest a field off an inbound frame may be before it reaches a log line or
+#: a reply. Nothing the page legitimately sends in one is longer than a config key.
+MAX_FIELD = 64
+
+#: The only things the page's own title bar may do to the native window. Anything
+#: else - navigate, evaluate, move to another screen - is not a title bar's business.
+WINDOW_ACTIONS = ("minimize", "maximize", "restore", "close", "resize")
+
+#: ``(min width, min height, max width, max height)`` for a size the page asks for.
+#: A frameless window cannot be resized by the operating system, so the page grows a
+#: grip of its own and sends what it dragged; these are the bounds of belief.
+WINDOW_BOUNDS = (320, 240, 7680, 4320)
+
 #: How long a writer waits on a silent bus before sending a ping.
 HEARTBEAT = 20.0
 
@@ -76,6 +97,10 @@ _LOOPBACK_BINDS = {"127.0.0.1", "::1", "[::1]"}
 
 #: Peers we will talk to, after ``::ffff:127.0.0.1`` has been folded onto IPv4.
 _LOOPBACK_PEERS = {"127.0.0.1", "::1"}
+
+#: A ticket as it appears in a URL. Used to take one back out of anything on its
+#: way to the log: the secret is only a secret while it is nowhere on disk.
+_TICKET_IN_TEXT = re.compile(r"([?&]t=)[A-Za-z0-9_-]+")
 
 #: Static file names we will serve. No slashes, no dots leading, no surprises.
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -175,6 +200,57 @@ SETTINGS: dict[str, Callable[[Any], Any]] = {
 }
 
 
+class _RefusalLog:
+    """Counts refusals that cost the caller nothing, and lets one line a minute out.
+
+    A page on the open web cannot get through this door — it cannot forge ``Host``,
+    it cannot forge ``Origin`` and it has no cookie — but it can knock, and a loop of
+    ``fetch('http://127.0.0.1:<port>/', {mode:'no-cors'})`` knocks several hundred
+    times a second. One record apiece at ERROR is a quarter of a megabyte a second
+    into ``logs/jarvis.log``: the whole shipped rotation budget, and with it the
+    transcript and the tool-call audit trail CLAUDE.md requires, recycled in under
+    two minutes. Worse, those records go to the window's bus as well, and a page that
+    can fill a 256-slot queue can push a pending ``confirm`` off the back of it and
+    hide the confirmation bar while a guarded tool is waiting.
+
+    So the refusal itself — which is unremarkable, and which the attacker chose —
+    goes to DEBUG, and what is genuinely worth knowing, that thousands arrived, comes
+    out at WARNING at most once every :data:`REFUSAL_INTERVAL` seconds.
+    """
+
+    def __init__(self, log: logging.Logger, interval: float = REFUSAL_INTERVAL) -> None:
+        self._log = log
+        self._interval = float(interval)
+        self._lock = threading.Lock()
+        self._count = 0
+        self._since = 0.0
+        self._next = 0.0
+        self._last = ""
+
+    def note(self, what: str, reason: str) -> None:
+        """Record one refusal. Always at DEBUG; sometimes, briefly, at WARNING."""
+        self._log.debug("Refusing %s: %s.", what, reason)
+        now = time.monotonic()
+        with self._lock:
+            self._count += 1
+            self._last = f"{what}: {reason}"
+            if now < self._next:
+                return
+            count, since, last = self._count, self._since, self._last
+            self._count = 0
+            self._since = now
+            self._next = now + self._interval
+        if count == 1:
+            self._log.warning("Refused a desk request — %s.", last)
+            return
+        self._log.warning(
+            "Refused %d desk requests in the last %.0f seconds, most recently %s.",
+            count,
+            max(0.0, now - since),
+            last,
+        )
+
+
 class _NoBus:
     """Stands in for :class:`~jarvis.desk.bus.DeskBus` when that module is missing.
 
@@ -263,8 +339,15 @@ class DeskServer:
         self._ticket_spent = False
         self._session = ""
 
+        # A hostile page cannot get in, but it can knock as fast as it likes, and the
+        # log is a finite resource. See :class:`_RefusalLog`.
+        self._refusals = _RefusalLog(self.log)
+
         self._lock = threading.Lock()
         self._bus_lock = threading.Lock()
+        #: The native host, once there is one. The page's own title bar has to drive
+        #: it through here: a frameless window has no buttons of the system's own.
+        self._window: Any = None
         self._bus: Any = bus
         self._running = threading.Event()
         self._closing = threading.Event()
@@ -288,7 +371,18 @@ class DeskServer:
             "routine": self._on_routine,
             "set": self._on_set,
             "quit": self._on_quit,
+            "window": self._on_window,
         }
+
+    def attach_window(self, window: Any) -> None:
+        """Hand the server the native host, so the page's title bar can drive it.
+
+        Attached rather than built here, and allowed to be ``None``, because the
+        window may not exist at all: ``--no-window``, a browser fallback, a machine
+        without WebView2. The frames still arrive; they simply have nothing to do.
+        """
+        with self._lock:
+            self._window = window
 
     # --- what the window is told ----------------------------------------------------
     @property
@@ -315,8 +409,39 @@ class DeskServer:
     # --- the door -------------------------------------------------------------------
     @property
     def url(self) -> str:
-        """The one URL that opens a window, ticket and all. Do not log this."""
-        return f"http://{self.display_host}:{self._bound_port}/?t={self._ticket}"
+        """The one URL that opens a window, ticket and all. Do not log this.
+
+        Reading it mints a fresh ticket when the last one has been spent or has timed
+        out. The alternative is what happens without it: the operator closes the
+        window to the tray, asks for it again an hour later, and is told by his own
+        assistant that his own link has already been used. A ticket is still good for
+        exactly one use — this hands out a new one rather than reviving the old.
+        """
+        if self._ticket_stale():
+            self.issue_ticket()
+        with self._lock:
+            ticket = self._ticket
+        return f"http://{self.display_host}:{self._bound_port}/?t={ticket}"
+
+    def issue_ticket(self) -> str:
+        """Mint a new ticket, clear the spent flag and restart the two-minute clock.
+
+        The tray calls this — through :attr:`url` — every time it opens the window
+        again. It is not a way back into an old session: the ticket is new, so a copy
+        of the previous one left in a command line or a process list stays worthless.
+        """
+        with self._lock:
+            self._ticket = secrets.token_urlsafe(32)
+            self._ticket_expires = time.monotonic() + TICKET_TTL
+            self._ticket_spent = False
+            ticket = self._ticket
+        self.log.debug("A fresh desk ticket was issued; it is good for %.0f s.", TICKET_TTL)
+        return ticket
+
+    def _ticket_stale(self) -> bool:
+        """True when the ticket in hand would be refused if it were offered now."""
+        with self._lock:
+            return self._ticket_spent or time.monotonic() > self._ticket_expires
 
     @property
     def safe_url(self) -> str:
@@ -444,9 +569,38 @@ class DeskServer:
         from werkzeug.serving import make_server  # noqa: PLC0415 - lazy on purpose
 
         bind = "::1" if self.host in ("::1", "[::1]") else "127.0.0.1"
-        server = make_server(bind, 0, app, threaded=True)
+        server = make_server(bind, 0, app, threaded=True, request_handler=self._handler_class())
         self._bound_port = int(server.socket.getsockname()[1])
         return server
+
+    def _handler_class(self) -> Any:
+        """A request handler that keeps the ticket off the console and out of a flood.
+
+        Werkzeug's default prints every request line to ``stderr``, query string and
+        all, which on a console run puts the one secret this module has in front of
+        anyone reading over the operator's shoulder — and hands a page that cannot
+        get in a second way to fill the screen, one our own rate limit does not cover.
+        Its occasional real complaints are still worth keeping, so they come here at
+        DEBUG, with any ticket taken out of them first.
+        """
+        from werkzeug.serving import WSGIRequestHandler  # noqa: PLC0415 - lazy on purpose
+
+        logger = self.log
+
+        class QuietHandler(WSGIRequestHandler):
+            """Werkzeug's handler with its access log turned off."""
+
+            def log_request(self, code: Any = "-", size: Any = "-") -> None:
+                return None
+
+            def log(self, type: str, message: str, *args: Any) -> None:  # noqa: A002
+                try:
+                    text = message % args if args else str(message)
+                except Exception:  # noqa: BLE001 - a log line is never worth a request
+                    text = str(message)
+                logger.debug("The desk's HTTP server: %s", _redacted(text))
+
+        return QuietHandler
 
     # --- the app --------------------------------------------------------------------
     def create_app(self) -> Any:
@@ -455,7 +609,10 @@ class DeskServer:
         from flask_sock import Sock  # noqa: PLC0415
 
         app = Flask(__name__, static_folder=None)
-        app.config["SOCK_SERVER_OPTIONS"] = {"ping_interval": 25}
+        # A frame from this page is a sentence and a couple of numbers. 64 KiB is
+        # already generous, and it is the only thing between a window that has gone
+        # wrong and a message the size of memory.
+        app.config["SOCK_SERVER_OPTIONS"] = {"ping_interval": 25, "max_message_size": 65536}
         sock = Sock(app)
         self._install_guard(app)
         self._register_routes(app)
@@ -473,7 +630,7 @@ class DeskServer:
             reason = self.refusal()
             if not reason:
                 return None
-            self.log.error("Refusing a desk request: %s.", reason)
+            self._refusals.note("a desk request", reason)
             return Response("Not for you.\n", status=403, mimetype="text/plain")
 
         @app.errorhandler(Exception)
@@ -493,7 +650,10 @@ class DeskServer:
         @app.get("/static/<name>")
         def asset(name: str) -> Any:
             if not self.cookie_is_ours(request.cookies.get(COOKIE_NAME)):
-                self.log.warning("An uncredentialed request asked for %r.", name)
+                self._refusals.note(
+                    "a desk asset request", f"there is no session cookie (it asked for "
+                    f"{str(name or '')[:MAX_FIELD]!r})"
+                )
                 return Response("Not for you.\n", status=401, mimetype="text/plain")
             return self._static(name)
 
@@ -642,7 +802,7 @@ class DeskServer:
         """The same three checks as a request, plus the cookie, before a socket lives."""
         reason = self.refusal()
         if reason:
-            self.log.error("Refusing a desk socket: %s.", reason)
+            self._refusals.note("a desk socket", reason)
             _send(ws, {"type": "error", "message": "Not for you."})
             _close(ws)
             return False
@@ -653,7 +813,7 @@ class DeskServer:
         except Exception:  # noqa: BLE001
             cookie = None
         if not self.cookie_is_ours(cookie):
-            self.log.warning("An uncredentialed socket tried to open the desk window.")
+            self._refusals.note("a desk socket", "it carried no session cookie")
             _send(ws, {"type": "error", "message": "Open the window from the tray, sir."})
             _close(ws)
             return False
@@ -736,7 +896,9 @@ class DeskServer:
         if not isinstance(frame, dict):
             self.log.warning("A desk window sent a %s, not an object.", type(frame).__name__)
             return {"type": "error", "message": "I expected an object, sir."}
-        kind = str(frame.get("type", "") or "").strip()
+        # Clamped before it can reach a log line or a reply: the field is under the
+        # page's control, and neither the log file nor the window's feed is.
+        kind = str(frame.get("type", "") or "").strip()[:MAX_FIELD]
         handler = self._handlers.get(kind)
         if handler is None:
             self.log.warning("A desk window sent the unknown frame type %r.", kind)
@@ -800,14 +962,56 @@ class DeskServer:
         if name.lower() not in known:
             self.log.warning("The desk window asked for the unknown routine %r.", name)
             return {"type": "error", "message": f"I have no routine called {name}, sir."}
-        found, said = self._ask("run_routine", name)
-        if not found:
+        if not callable(getattr(self.assistant, "run_routine", None)):
+            self.log.error("This build of JARVIS has no run_routine hook; the window asked for it.")
             return _no_hook("run_routine")
         self.log.info("Desk routine %r.", name)
-        return {"type": "ack", "for": "routine", "name": name, "said": str(said or "")}
+        # On its own thread, like quit: a macro may contain a GUARDED tool, and the
+        # confirmation it raises can only be answered by a frame arriving on this
+        # reader thread. Running it here would mean the page shows a Confirm button
+        # whose click nothing is left to read — the two would wait for each other
+        # until the confirmation timed out. So the page is answered at once and what
+        # the routine said reaches it the way every other spoken line does.
+        threading.Thread(
+            target=self._run_routine, args=(name,), name="jarvis-desk-routine", daemon=True
+        ).start()
+        return {"type": "ack", "for": "routine", "name": name}
+
+    def _run_routine(self, name: str) -> None:
+        """Run one macro off the socket's threads and put its line on the bus."""
+        found, said = self._ask("run_routine", name)
+        if not found:
+            return
+        line = str(said or "").strip()
+        if line:
+            self._publish_line(line)
+
+    def _publish_line(self, said: str) -> None:
+        """Publish what the routine said, unless the assistant has already said it.
+
+        A macro speaks through the assistant, and the assistant narrates itself onto
+        this same bus, so the line is usually already on its way to the window;
+        publishing it again would print it twice. Publishing it never would leave a
+        routine silent in a build where that narration is not wired up. So: look at
+        what the bus has just seen, and only fill the gap.
+        """
+        try:
+            recent = list(self.bus.replay())[-8:]
+        except Exception:  # noqa: BLE001 - a bus that cannot be read is not our problem
+            recent = []
+        for event in recent:
+            payload = getattr(event, "payload", None)
+            if str(getattr(event, "type", "")) != "sentence" or not isinstance(payload, dict):
+                continue
+            if str(payload.get("text", "")).strip() == said:
+                return
+        try:
+            self.bus.publish("sentence", text=said)
+        except Exception:  # noqa: BLE001 - the window is never worth a routine
+            self.log.debug("Publishing the routine's line failed.", exc_info=True)
 
     def _on_set(self, frame: dict) -> dict:
-        key = str(frame.get("key", "") or "").strip()
+        key = str(frame.get("key", "") or "").strip()[:MAX_FIELD]
         rule = SETTINGS.get(key)
         if rule is None:
             self.log.warning("The desk window tried to set %r, which is not allowed.", key)
@@ -827,6 +1031,63 @@ class DeskServer:
             return {"type": "error", "message": f"I could not change {key}, sir."}
         self.log.info("The desk window set %s to %r.", key, value)
         return {"type": "ack", "for": "set", "key": key, "value": value}
+
+    def _on_window(self, frame: dict) -> dict:
+        """The page's own title bar: minimise, maximise, restore, close, resize.
+
+        The window is frameless, so the buttons at its top right are ours and this is
+        the only way they can do anything at all. ``close`` means hide: the tray's
+        ``Open JARVIS`` reverses it, and a title bar that could actually end the
+        session would put shutting JARVIS down one mis-click away.
+        """
+        action = str(frame.get("action", "") or "").strip().lower()[:MAX_FIELD]
+        if action not in WINDOW_ACTIONS:
+            self.log.warning(
+                "The desk window asked for %r, which is not one of my window actions.", action
+            )
+            return {"type": "error", "message": "I cannot do that to the window, sir."}
+        size: tuple[int, int] | None = None
+        if action == "resize":
+            try:
+                size = _window_size(frame.get("width"), frame.get("height"))
+            except (TypeError, ValueError) as exc:
+                self.log.warning("The desk window asked for an unusable size: %s", exc)
+                return {"type": "error", "message": "That is not a usable window size, sir."}
+        self._drive_window(action, size)
+        return {"type": "ack", "for": "window", "action": action}
+
+    def _drive_window(self, action: str, size: tuple[int, int] | None) -> None:
+        """Do it to the native host, or write down that there was nothing to do it to.
+
+        Never raises, whatever the host turns out to be: the page is entitled to press
+        its own buttons in a browser tab, where there is no native window behind them,
+        and a dead title bar is a better outcome than a machine error per click.
+        """
+        with self._lock:
+            window = self._window
+        if window is None:
+            self.log.debug("The window was asked to %s, but none is attached.", action)
+            return
+        # An explicit table, for the same reason the frame table is one: the name of
+        # a method never comes off a web page, not even one we have just checked.
+        name = {
+            "close": "hide",
+            "minimize": "minimize",
+            "maximize": "maximize",
+            "restore": "restore",
+            "resize": "resize",
+        }[action]
+        method = getattr(window, name, None)
+        if not callable(method):
+            self.log.debug("This window host cannot %s.", action)
+            return
+        try:
+            if size is not None:
+                method(*size)
+            else:
+                method()
+        except Exception as exc:  # noqa: BLE001 - a title bar is not worth a traceback
+            self.log.warning("The window would not %s: %s", action, exc)
 
     def _on_quit(self, frame: dict) -> dict:
         stop = getattr(self.assistant, "stop", None)
@@ -870,7 +1131,19 @@ class DeskServer:
             "paused": self.current_state() == "paused",
             "routines": [routine.as_json() for routine in self.routines],
             "tools": self._tools(),
+            "settings": self._settings(),
         }
+
+    def _settings(self) -> dict:
+        """What the page's switches and sliders are actually set to, right now.
+
+        Without this the window guesses: a switch drawn off first opened showed the
+        opposite of the truth until the operator touched it, and touching it wrote
+        the guess to ``config.yaml``. The same allowlist as ``set``, read in the same
+        direction, so the window learns about exactly the keys it may change and not
+        one line of the rest of the configuration.
+        """
+        return {key: _cfg(self.cfg, key, None) for key in SETTINGS}
 
     def current_state(self) -> str:
         bus = self._state_bus()
@@ -995,6 +1268,32 @@ def _frame(event: Any) -> dict:
     frame["type"] = str(getattr(event, "type", "event") or "event")
     frame["at"] = float(getattr(event, "at", 0.0) or 0.0)
     return frame
+
+
+def _window_size(width: Any, height: Any) -> tuple[int, int]:
+    """Read a window size off a frame: two whole numbers, inside :data:`WINDOW_BOUNDS`.
+
+    Clamped rather than refused for the same reason the sliders are: a grip dragged
+    off the edge of a 4K screen means "as big as you go", not an attack. Nonsense —
+    a string that is not a number, a list, ``NaN``, ``True`` — is still refused,
+    because it means the frame did not come from our page.
+    """
+    low_w, low_h, high_w, high_h = WINDOW_BOUNDS
+    return _whole(width, low_w, high_w), _whole(height, low_h, high_h)
+
+
+def _whole(value: Any, low: int, high: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"expected a number, got {type(value).__name__}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("expected a finite number")
+    return int(min(high, max(low, round(number))))
+
+
+def _redacted(text: str) -> str:
+    """Take any ticket out of a line before anything writes it down."""
+    return _TICKET_IN_TEXT.sub(r"\1...", str(text))
 
 
 def _no_hook(name: str) -> dict:

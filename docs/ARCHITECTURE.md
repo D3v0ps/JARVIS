@@ -938,8 +938,15 @@ Page to server (`/ws/desk`, JSON frames):
 | `confirm` | `granted: bool` answers a pending GUARDED confirmation |
 | `pause` / `resume` | the same toggle the tray has |
 | `routine` | run a named macro from `remote.routines` |
-| `set` | one key from a small allowlist: `tts.speed`, `audio.chime_volume`, `assistant.brief_mode`, `wake.sensitivity`, `ui.always_on_top` |
+| `set` | one key from a small allowlist: `tts.speed`, `audio.chime_volume`, `assistant.brief_mode`, `wake.sensitivity`, `ui.always_on_top`. `SETTINGS` in `desk/server.py` is the single table: it holds both the key allowlist and, per key, the validator that clamps the value |
+| `window` | `minimize`, `maximize`, `restore`, `close` (hide to the tray), `resize` with `width`/`height`. A frameless window cannot be resized by Windows, so the page grows a grip of its own and sends what it dragged; the server clamps it |
 | `quit` | `assistant.stop()` |
+
+Every command is answered with `{"type": "ack", "for": <command>, ...}`, carrying `ok:
+false` when the assistant declined - he is mid-turn, or nothing was waiting to be
+confirmed. The page turns that into a spoken-register line rather than a dead button.
+The `hello` frame also carries `settings`, the current value of each allowlisted key, so
+the window's switches open showing what is true rather than guessing.
 
 Anything else is answered with an `error` frame and logged. No frame may reach `eval`,
 the dispatcher or the config by name that is not on these lists.
@@ -990,10 +997,21 @@ class DeskWindow:
     def stop(self) -> None
 ```
 
-Order: `pywebview` (frameless, `easy_drag`, remembered size and position, closing hides
+Order: `pywebview` (frameless, `easy_drag=False` - it is on by default and turns the
+whole page into a drag handle, so no text can be selected and a slider drags the window
+instead of sliding; the page's own `.pywebview-drag-region` title bar is registered
+separately and is the only drag region - remembered size and position, closing hides
 to the tray instead of quitting) → `msedge --app=<url>` with a dedicated
 `--user-data-dir` under `logs/` so it never touches the user's profile → the default
 browser → `none`, which logs one line and leaves the ring to do its job.
+
+`frameless=True` sets `FormBorderStyle.None` on WinForms, which has no resize border at
+all, and pywebview exposes no `WM_NCHITTEST` hook. Rather than reach into the form with
+native code, the page provides the grip and the host provides `resize()`: the operator
+drags the corner, the page sends `window`/`resize` frames, and the window obeys. That is
+also why `MIN_SIZE` is `(900, 620)` and not something smaller - the page's one-column
+breakpoint is 899px, and a window that cannot show both of its columns at its own
+minimum has the wrong minimum.
 
 **The main thread** belongs to whoever must have it. `LayeredOverlay` already declares
 `needs_main_thread = False` and runs its own message pump, so on Windows the reactor and
@@ -1014,7 +1032,11 @@ The layout is a single column of live evidence, not a chat log:
 * **telemetry**: CPU, RAM, GPU load and temperature, VRAM, the model that is resident;
 * **timers and reminders**, counting down, cancellable;
 * **a confirmation bar** that appears for a GUARDED tool with Confirm and Cancel, next to
-  the spoken window - whichever answers first wins;
+  the spoken window - whichever answers first wins. **Cancel** takes the keyboard focus,
+  never Confirm: this bar is raised by the tools that delete files and shut the machine
+  down, and Enter is what a startled operator presses. Each question carries an id and
+  the confirm section is serialised, so one answer can never be spent on a different
+  tool, and a second guarded tool queues rather than replacing the first;
 * **a composer** for typed turns, and the routine buttons;
 * **a log drawer**, collapsed by default, tailing `logs/jarvis.log` through the bus.
 
@@ -1031,6 +1053,12 @@ a face that is already in the user's hand. When a third face appears, extract th
 no `start-jarvis.bat`, no black rectangle at any point. When the process exits non-zero
 it shows a message box with the last lines of `logs\jarvis.log` and a button that opens
 the file. `start-jarvis.bat` stays exactly as it is for anyone who wants the console.
+
+Nothing else may open one either: the Piper TTS fallback shells out per sentence, and
+without `CREATE_NO_WINDOW` that is a black rectangle flashing up on every line JARVIS
+speaks - the exact complaint this section exists to answer. A test walks the source for
+`subprocess` calls that lack the flag, with an explicit allowlist for the programs the
+operator runs from a terminal himself.
 
 Under `pythonw` there is no `sys.stdout`: `print()` becomes a silent no-op (CPython
 returns early when `sys.stdout is None`), but a `StreamHandler` over `None` raises on

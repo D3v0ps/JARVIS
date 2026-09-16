@@ -24,6 +24,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -43,6 +44,10 @@ _LOG = logger
 DEFAULT_SAMPLE_RATE = 22_050
 #: How long the command-line back-end may take for one utterance.
 CLI_TIMEOUT_S = 60.0
+#: ``subprocess`` flag that keeps Windows from giving a child process a console of its
+#: own. The same constant as in :mod:`jarvis.tools.system_tools`; spelled out here so
+#: this module stays importable without the tools package.
+CREATE_NO_WINDOW = 0x08000000
 
 _MODEL_HINT = "run 'python scripts/fetch_models.py --swedish' to download it"
 
@@ -256,6 +261,7 @@ class PiperTTS:
             completed = subprocess.run(
                 command, input=text.encode("utf-8"), stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, timeout=CLI_TIMEOUT_S, check=False,
+                **_popen_kwargs(),
             )
             if completed.returncode != 0:
                 detail = completed.stderr.decode("utf-8", errors="replace").strip()
@@ -298,6 +304,16 @@ class PiperTTS:
 
 
 # --- helpers --------------------------------------------------------------------------
+def _popen_kwargs() -> dict[str, Any]:
+    """Extra ``subprocess`` keywords: hide the console window on Windows only.
+
+    Started from ``pythonw.exe`` JARVIS has no console, so every Piper utterance would
+    otherwise open one of its own: a black rectangle flashing over whatever the operator
+    is doing, once per spoken sentence.
+    """
+    return {"creationflags": CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
+
 def _resolve(value: str | Path | None, default: str) -> Path:
     """Resolve a model path against the project root, honouring absolute paths and ``~``."""
     raw = str(value) if value not in (None, "") else default

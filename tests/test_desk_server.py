@@ -31,10 +31,14 @@ import pytest
 from jarvis.core.state import AssistantState, StateBus
 from jarvis.desk.server import (
     COOKIE_NAME,
+    MAX_FIELD,
     MAX_SAY,
     SETTINGS,
     TICKET_TTL,
+    WINDOW_ACTIONS,
+    WINDOW_BOUNDS,
     DeskServer,
+    _RefusalLog,
     _Window,
 )
 
@@ -45,8 +49,11 @@ SOURCE = (Path(__file__).resolve().parent.parent / "jarvis" / "desk" / "server.p
 #: A scripted receive() that means "nothing arrived before the timeout".
 TIMEOUT = object()
 
-#: Every frame the page is allowed to send, per contract 24.3.
-FRAME_TYPES = {"say", "listen", "stop", "confirm", "pause", "resume", "routine", "set", "quit"}
+#: Every frame the page is allowed to send: the nine of contract 24.3 and the tenth
+#: the title bar needs, because a frameless window has no buttons of the system's own.
+FRAME_TYPES = {
+    "say", "listen", "stop", "confirm", "pause", "resume", "routine", "set", "quit", "window",
+}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -200,6 +207,39 @@ class DeadSocket(FakeSocket):
         raise ConnectionError("nobody is reading")
 
 
+class FakeWindow:
+    """The native host, recording what the page's title bar asked of it.
+
+    The window itself belongs to :mod:`jarvis.desk.window`; what matters here is
+    which of its methods the server reaches for, that it reaches for nothing else,
+    and that a host which says no costs the page nothing.
+    """
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.calls: list[tuple] = []
+        self.explode = explode
+
+    def _did(self, name: str, *args) -> None:
+        self.calls.append((name, *args))
+        if self.explode:
+            raise RuntimeError("the window manager said no")
+
+    def hide(self) -> None:
+        self._did("hide")
+
+    def minimize(self) -> None:
+        self._did("minimize")
+
+    def maximize(self) -> None:
+        self._did("maximize")
+
+    def restore(self) -> None:
+        self._did("restore")
+
+    def resize(self, width: int, height: int) -> None:
+        self._did("resize", width, height)
+
+
 class FakeDispatcher:
     """The assistant's own dispatcher. The desk must run turns under this one."""
 
@@ -274,6 +314,36 @@ class FakeAssistant:
 # ----------------------------------------------------------------------------------
 # Fixtures
 # ----------------------------------------------------------------------------------
+class WaitingAssistant(FakeAssistant):
+    """An assistant whose routine contains a GUARDED tool, so it waits to be told yes.
+
+    This is the ordinary case for a macro that turns the lights off by way of
+    PowerShell, and it is the case that deadlocked: the routine ran on the socket's
+    reader thread, so the Confirm button on the bar it raised had nothing left to
+    read it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.asked = threading.Event()
+        self.answered = threading.Event()
+        #: Was the confirmation delivered while the macro was still waiting for it?
+        #: That is the whole question: an answer that only lands after the routine
+        #: has given up is the deadlock, not the fix.
+        self.confirmed = False
+
+    def run_routine(self, name: str) -> str:
+        self.routines.append(name)
+        self.asked.set()
+        self.confirmed = self.answered.wait(timeout=2)
+        return "Goodnight, sir." if self.confirmed else ""
+
+    def answer_confirmation(self, granted: bool) -> bool:
+        self.confirmations.append(granted)
+        self.answered.set()
+        return True
+
+
 @pytest.fixture
 def desk_config(config):
     config.set(
@@ -365,6 +435,21 @@ def run_socket(server, app, ws, *, cookie: str | None = None, **kwargs) -> FakeS
     with socket_context(server, app, cookie=cookie, **kwargs):
         server.desk_socket(ws)
     return ws
+
+
+def path_of(url: str) -> str:
+    """The ``/?t=...`` half of a URL, which is what a test client asks for."""
+    return "/" + url.split("/", 3)[3]
+
+
+def waited_for(predicate, timeout: float = 5.0) -> bool:
+    """True as soon as ``predicate`` holds; a background thread is not instant."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 # ----------------------------------------------------------------------------------
@@ -506,7 +591,8 @@ def test_a_request_from_a_peer_that_is_not_loopback_is_refused(server, client, r
     )
 
     assert response.status_code == 403
-    assert any("loopback interface" in line for line in recorder.at(logging.ERROR))
+    # A summary, not a record per knock: see the flood tests further down.
+    assert any("loopback interface" in line for line in recorder.at(logging.WARNING))
 
 
 def test_a_forged_host_header_is_refused(server, client, recorder):
@@ -519,7 +605,7 @@ def test_a_forged_host_header_is_refused(server, client, recorder):
 
     assert response.status_code == 403
     assert server._ticket_spent is False
-    assert any("Host header" in line for line in recorder.at(logging.ERROR))
+    assert any("Host header" in line for line in recorder.at(logging.WARNING))
 
 
 def test_a_forged_origin_is_refused(server, client, recorder):
@@ -527,7 +613,7 @@ def test_a_forged_origin_is_refused(server, client, recorder):
     response = get(client, server, f"/?t={server._ticket}", Origin="https://evil.example")
 
     assert response.status_code == 403
-    assert any("Origin" in line for line in recorder.at(logging.ERROR))
+    assert any("Origin" in line for line in recorder.at(logging.WARNING))
 
 
 def test_our_own_origin_is_accepted(server, client):
@@ -553,7 +639,7 @@ def test_the_socket_applies_the_same_three_checks_as_a_request(server, app, assi
 
     assert ws.closed is True
     assert assistant.turns == []
-    assert any("Host header" in line for line in recorder.at(logging.ERROR))
+    assert any("Host header" in line for line in recorder.at(logging.WARNING))
 
 
 def test_a_socket_with_a_forged_origin_is_closed(server, app, assistant):
@@ -668,7 +754,11 @@ def test_the_paused_flag_in_hello_follows_the_state_bus(server, app, assistant):
 # The frame table
 # ----------------------------------------------------------------------------------
 def test_the_handler_table_is_an_explicit_dict_of_exactly_the_documented_frames(server):
-    """Contract 24.3 lists nine frames. A tenth must be a deliberate edit here."""
+    """Contract 24.3 lists nine frames, and the title bar adds ``window``.
+
+    An eleventh must be a deliberate edit here: this table is the only thing that
+    decides what a string arriving off a web socket is allowed to reach.
+    """
     assert set(server._handlers) == FRAME_TYPES
     assert all(callable(handler) for handler in server._handlers.values())
 
@@ -1216,7 +1306,7 @@ def test_stop_is_idempotent_and_safe_before_the_server_ever_started(server):
 # ----------------------------------------------------------------------------------
 # One real socket, end to end
 # ----------------------------------------------------------------------------------
-def test_a_real_loopback_request_gets_in_once_and_is_refused_the_second_time(server):
+def test_a_real_loopback_request_gets_in_once_and_the_same_link_never_twice(server):
     """Everything above fakes the request; this one is a genuine browser-shaped GET."""
     pytest.importorskip("flask")
     pytest.importorskip("flask_sock")
@@ -1224,13 +1314,14 @@ def test_a_real_loopback_request_gets_in_once_and_is_refused_the_second_time(ser
     assert server.start() is True
     # The container routes HTTP through a proxy; loopback must not go near it.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    link = server.url  # held, because reading the property again mints a new one
 
     try:
-        with opener.open(server.url, timeout=10) as response:
+        with opener.open(link, timeout=10) as response:
             assert response.status == 200
             assert "HttpOnly" in response.headers.get("Set-Cookie", "")
         with pytest.raises(urllib.error.HTTPError) as caught:
-            opener.open(server.url, timeout=10)
+            opener.open(link, timeout=10)
         assert caught.value.code == 401
 
         with pytest.raises(urllib.error.HTTPError) as forged:
@@ -1239,3 +1330,550 @@ def test_a_real_loopback_request_gets_in_once_and_is_refused_the_second_time(ser
         assert forged.value.code == 403
     finally:
         server.stop()
+
+
+# ----------------------------------------------------------------------------------
+# The door under a flood
+# ----------------------------------------------------------------------------------
+def test_a_thousand_refused_requests_leave_at_most_a_couple_of_lines_above_debug(
+    server, client, recorder
+):
+    """A page on the open web cannot get in, but it can knock, and the log is finite.
+
+    ``fetch('http://127.0.0.1:<port>/', {mode:'no-cors'})`` in a loop produced 704
+    records a second at ERROR — 236 KB/s, which recycles the shipped 20 MB rotation
+    budget in about a minute and a half and takes the transcript and the tool-call
+    audit trail CLAUDE.md requires with it. The same records went to the window's
+    bus, where a 256-slot queue full of log events pushed a pending ``confirm`` off
+    the back: a browser-reachable way to hide the confirmation bar while a guarded
+    tool is waiting. So the detail goes to DEBUG and only a count comes out loud.
+    """
+    for _ in range(1000):
+        assert get(client, server, "/", Origin="https://evil.example").status_code == 403
+
+    assert len(recorder.at(logging.WARNING)) <= 2
+    assert len(recorder.records) >= 1000  # the detail is still there, at DEBUG
+
+
+def test_a_flood_of_uncredentialed_assets_is_counted_rather_than_written_out(
+    server, client, recorder
+):
+    """The asset route is the second door, and it was the second flood channel."""
+    for _ in range(500):
+        assert get(client, server, "/static/desk.css").status_code == 401
+
+    assert len(recorder.at(logging.WARNING)) <= 2
+
+
+@pytest.mark.parametrize("door", ["no cookie", "forged origin"])
+def test_a_flood_of_refused_sockets_is_counted_rather_than_written_out(
+    server, app, recorder, assistant, door
+):
+    """And the third: an upgrade that dies on the doorstep costs one DEBUG line.
+
+    Both of its doorsteps. The three header checks and the cookie refuse at
+    different points and logged at different levels, and a flood through either
+    fills the same file.
+    """
+    cookie = admitted(server) if door == "forged origin" else None
+    origin = "https://evil.example" if door == "forged origin" else None
+
+    for _ in range(500):
+        ws = run_socket(
+            server, app, FakeSocket([json.dumps({"type": "quit"})]), cookie=cookie,
+            **({"origin": origin} if origin else {}),
+        )
+        assert ws.closed is True
+
+    assert assistant.stopped.is_set() is False
+    assert len(recorder.at(logging.WARNING)) <= 2
+
+
+def test_the_one_line_that_does_come_out_says_how_many_were_refused_and_why(recorder):
+    """A count is the only interesting thing about a flood; the last reason is the clue."""
+    log = logging.getLogger("desk-test-refusals")
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    log.addHandler(recorder)
+    counter = _RefusalLog(log, interval=0.05)
+
+    try:
+        for _ in range(50):
+            counter.note("a desk request", "the Origin 'https://evil.example' is not ours")
+        time.sleep(0.06)
+        counter.note("a desk request", "the Origin 'https://evil.example' is not ours")
+    finally:
+        log.removeHandler(recorder)
+
+    summaries = recorder.at(logging.WARNING)
+    assert len(summaries) == 2
+    assert "Refused 50 desk requests" in summaries[1]
+    assert "evil.example" in summaries[1]
+
+
+def test_a_refusal_that_happens_once_is_still_reported_at_once(server, client, recorder):
+    """Rate limiting must not turn the one refusal worth reading into silence."""
+    assert get(client, server, "/", Origin="https://evil.example").status_code == 403
+
+    assert any("Origin" in line for line in recorder.at(logging.WARNING))
+
+
+# ----------------------------------------------------------------------------------
+# The title bar
+# ----------------------------------------------------------------------------------
+def test_the_window_actions_are_exactly_the_five_a_title_bar_needs(server):
+    """Navigating, evaluating and moving to another screen are not a title bar's work."""
+    assert set(WINDOW_ACTIONS) == {"minimize", "maximize", "restore", "close", "resize"}
+    assert "window" in server._handlers
+
+
+@pytest.mark.parametrize(
+    "action, called",
+    [
+        ("minimize", "minimize"),
+        ("maximize", "maximize"),
+        ("restore", "restore"),
+        ("close", "hide"),
+    ],
+)
+def test_the_title_bars_buttons_reach_the_native_window(server, app, action, called):
+    """The window is frameless, so these buttons are ours and this is all they have.
+
+    They sent a ``window`` frame that no handler accepted: Minimise and Close did
+    nothing whatever, answered with a machine error, and the window could not be put
+    away or shrunk by any means at all.
+    """
+    window = FakeWindow()
+    server.attach_window(window)
+    cookie = admitted(server)
+
+    ws = run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "window", "action": action})]),
+        cookie=cookie,
+    )
+
+    assert window.calls == [(called,)]
+    assert [event for event in ws.events if event["type"] == "ack"] == [
+        {"type": "ack", "for": "window", "action": action}
+    ]
+
+
+def test_close_puts_the_window_in_the_tray_rather_than_ending_the_session(
+    server, app, assistant
+):
+    """Closing to the tray is reversible from the tray; ending the session is not."""
+    window = FakeWindow()
+    server.attach_window(window)
+    cookie = admitted(server)
+
+    run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "window", "action": "close"})]),
+        cookie=cookie,
+    )
+
+    assert window.calls == [("hide",)]
+    assert assistant.stopped.is_set() is False
+
+
+@pytest.mark.parametrize(
+    "sent, wanted",
+    [
+        ((1200, 800), (1200, 800)),
+        ((1200.6, 800.4), (1201, 800)),
+        (("1200", "800"), (1200, 800)),
+        ((10, 10), (WINDOW_BOUNDS[0], WINDOW_BOUNDS[1])),
+        ((99999, 99999), (WINDOW_BOUNDS[2], WINDOW_BOUNDS[3])),
+    ],
+)
+def test_a_size_from_the_page_is_whole_and_inside_sane_bounds(server, app, sent, wanted):
+    """A grip dragged off the edge of the screen means "as big as you go", not 99999."""
+    window = FakeWindow()
+    server.attach_window(window)
+    cookie = admitted(server)
+    frame = {"type": "window", "action": "resize", "width": sent[0], "height": sent[1]}
+
+    run_socket(server, app, FakeSocket([json.dumps(frame)]), cookie=cookie)
+
+    assert window.calls == [("resize", wanted[0], wanted[1])]
+
+
+@pytest.mark.parametrize(
+    "width, height",
+    [
+        ("wide", 800),
+        (None, 800),
+        (1200, None),
+        (True, 800),
+        (float("nan"), 800),
+        (float("inf"), 800),
+        ([1200], 800),
+        (1200, {"height": 800}),
+    ],
+)
+def test_a_size_that_is_not_a_pair_of_numbers_is_refused_and_logged(
+    server, app, recorder, width, height
+):
+    """Nonsense in a size field means the frame did not come from our page."""
+    window = FakeWindow()
+    server.attach_window(window)
+    cookie = admitted(server)
+    frame = {"type": "window", "action": "resize", "width": width, "height": height}
+
+    ws = run_socket(server, app, FakeSocket([json.dumps(frame)]), cookie=cookie)
+
+    assert window.calls == []
+    assert "error" in ws.kinds()
+    assert any("unusable size" in line for line in recorder.at(logging.WARNING))
+
+
+@pytest.mark.parametrize(
+    "action", ["", "destroy", "evaluate_js", "load_url", "toggle", "__init__", "hide", "show"]
+)
+def test_a_window_action_that_is_not_on_the_list_never_reaches_the_host(
+    server, app, recorder, action
+):
+    """An allowlist, and the page's own spelling: ``close``, never ``hide``."""
+    window = FakeWindow()
+    server.attach_window(window)
+    cookie = admitted(server)
+
+    ws = run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "window", "action": action})]),
+        cookie=cookie,
+    )
+
+    assert window.calls == []
+    assert "error" in ws.kinds()
+    assert any("window actions" in line for line in recorder.at(logging.WARNING))
+
+
+def test_a_window_frame_with_no_window_attached_is_a_logged_no_op(server, app, recorder):
+    """--no-window, a browser tab, a machine without WebView2: the buttons remain."""
+    cookie = admitted(server)
+
+    ws = run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "window", "action": "minimize"})]),
+        cookie=cookie,
+    )
+
+    assert "error" not in ws.kinds()
+    assert any("none is attached" in record.getMessage() for record in recorder.records)
+
+
+@pytest.mark.parametrize("host", ["explodes", "bare"])
+def test_a_host_that_refuses_or_has_no_such_method_never_raises_into_the_page(
+    server, app, host
+):
+    """Nothing in a face may raise into the assistant, least of all a title bar."""
+    server.attach_window(FakeWindow(explode=True) if host == "explodes" else SimpleNamespace())
+    cookie = admitted(server)
+
+    ws = run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "window", "action": "minimize"})]),
+        cookie=cookie,
+    )
+
+    assert "ack" in ws.kinds()
+    assert "error" not in ws.kinds()
+
+
+# ----------------------------------------------------------------------------------
+# Opening the window a second time
+# ----------------------------------------------------------------------------------
+def test_two_consecutive_opens_from_the_tray_both_work(server, app):
+    """The ticket is single-use, so the second open was told its own link was spent.
+
+    Closing the window to the tray and asking for it again an hour later is the
+    ordinary way this app is used, and it was the one way it could not be.
+    """
+    first = server.url
+    assert get(app.test_client(), server, path_of(first)).status_code == 200
+
+    second = server.url
+
+    assert second != first
+    assert get(app.test_client(), server, path_of(second)).status_code == 200
+
+
+def test_a_spent_ticket_is_still_refused_after_a_fresh_one_has_been_issued(server, app):
+    """Re-opening the window mints a new link; it does not revive the used one."""
+    stale = server.url
+    assert get(app.test_client(), server, path_of(stale)).status_code == 200
+    fresh = server.url
+
+    assert get(app.test_client(), server, path_of(stale)).status_code == 401
+    assert get(app.test_client(), server, path_of(fresh)).status_code == 200
+
+
+def test_reading_the_url_again_does_not_churn_a_ticket_that_is_still_good(server):
+    """Only a spent or timed-out ticket is replaced: the URL is not a random number."""
+    assert server.url == server.url
+
+
+def test_a_ticket_that_timed_out_is_replaced_rather_than_offered_again(server):
+    """Two minutes after start-up the tray must still be able to open a window."""
+    stale = server._ticket
+    server._ticket_expires = time.monotonic() - 1.0
+
+    assert stale not in server.url
+
+
+def test_issue_ticket_clears_the_spent_flag_and_restarts_the_clock(server):
+    """What the tray calls when it opens the window again."""
+    old = server._ticket
+    server._ticket_spent = True
+    server._ticket_expires = time.monotonic() - 1.0
+
+    fresh = server.issue_ticket()
+
+    assert fresh != old
+    assert len(fresh) >= 40  # token_urlsafe(32) is 43 characters
+    assert server._ticket_spent is False
+    assert server._ticket_expires > time.monotonic() + TICKET_TTL - 5
+
+
+def test_a_reissued_ticket_is_never_written_to_the_log(server, recorder):
+    """The new one is exactly as much of a secret as the one it replaces."""
+    fresh = server.issue_ticket()
+
+    written = "\n".join(record.getMessage() for record in recorder.records)
+    assert fresh not in written
+
+
+# ----------------------------------------------------------------------------------
+# A routine must not block the socket
+# ----------------------------------------------------------------------------------
+def test_a_routine_that_waits_for_a_confirmation_can_still_be_confirmed(server, app):
+    """A macro may contain a GUARDED tool, and the Confirm button is a socket frame.
+
+    Running the macro on the reader thread meant the page showed a bar whose click
+    nothing was left to read: the routine waited for a confirmation that could only
+    arrive over the thread it was standing on. Both sides waited until the timeout.
+    """
+    assistant = WaitingAssistant()
+    server.assistant = assistant
+    cookie = admitted(server)
+    script = [
+        json.dumps({"type": "routine", "name": "Good night"}),
+        lambda: assistant.asked.wait(timeout=5),
+        json.dumps({"type": "confirm", "granted": True}),
+    ]
+
+    ws = run_socket(server, app, FakeSocket(script, linger=0.2), cookie=cookie)
+
+    assert assistant.confirmations == [True]
+    assert assistant.confirmed is True  # answered while it waited, not after it gave up
+    assert "ack" in ws.kinds()
+
+
+def test_the_page_is_acknowledged_before_the_routine_has_finished(server, app):
+    """The ack says "heard", not "done": what the routine did arrives on the bus."""
+    assistant = WaitingAssistant()
+    server.assistant = assistant
+    cookie = admitted(server)
+
+    started = time.monotonic()
+    ws = run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "routine", "name": "Good night"})], linger=0.1),
+        cookie=cookie,
+    )
+    elapsed = time.monotonic() - started
+    acks = [event for event in ws.events if event["type"] == "ack"]
+
+    assert acks == [{"type": "ack", "for": "routine", "name": "Good night"}]
+    assert elapsed < 1.0  # the macro is still waiting to be confirmed, and may wait
+    assert assistant.answered.is_set() is False
+    assistant.answered.set()
+
+
+def test_what_the_routine_said_reaches_the_window_through_the_bus(server, app, bus, assistant):
+    """The spoken line cannot ride on the ack any more, so it goes the way lines do."""
+    cookie = admitted(server)
+
+    run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "routine", "name": "Good night"})]),
+        cookie=cookie,
+    )
+
+    assert waited_for(lambda: assistant.routines == ["Good night"])
+    assert waited_for(
+        lambda: any(
+            event.type == "sentence" and event.payload.get("text") == "Goodnight, sir."
+            for event in bus.replay()
+        )
+    )
+
+
+def test_a_line_the_assistant_has_already_published_is_not_printed_twice(
+    server, app, bus, assistant
+):
+    """The macro speaks through the assistant, which narrates itself onto this bus."""
+    def narrate(name: str) -> str:
+        assistant.routines.append(name)
+        bus.publish("sentence", text="Goodnight, sir.")
+        return "Goodnight, sir."
+
+    assistant.run_routine = narrate
+    cookie = admitted(server)
+
+    run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "routine", "name": "Good night"})]),
+        cookie=cookie,
+    )
+
+    assert waited_for(lambda: assistant.routines == ["Good night"])
+    time.sleep(0.1)
+    spoken = [event for event in bus.replay() if event.type == "sentence"]
+    assert len(spoken) == 1
+
+
+def test_an_unknown_routine_is_still_refused_before_any_thread_is_started(
+    server, app, assistant, recorder
+):
+    """Threading the run must not thread past the allowlist that guards it."""
+    cookie = admitted(server)
+
+    ws = run_socket(
+        server, app,
+        FakeSocket([json.dumps({"type": "routine", "name": "Format the disk"})]),
+        cookie=cookie,
+    )
+
+    time.sleep(0.05)
+    assert assistant.routines == []
+    assert "error" in ws.kinds()
+
+
+# ----------------------------------------------------------------------------------
+# Bounded frames
+# ----------------------------------------------------------------------------------
+def test_the_socket_will_not_read_a_frame_larger_than_sixty_four_kilobytes(app):
+    """Every frame the page sends is a sentence and a couple of numbers."""
+    options = app.config["SOCK_SERVER_OPTIONS"]
+
+    assert options["max_message_size"] == 65536
+    assert options["ping_interval"] == 25
+
+
+@pytest.mark.parametrize(
+    "frame, letter",
+    [
+        ({"type": "z" * 5000}, "z"),
+        ({"type": "set", "key": "k" * 5000, "value": 1}, "k"),
+        ({"type": "window", "action": "w" * 5000}, "w"),
+    ],
+)
+def test_a_field_off_a_frame_is_clamped_before_it_reaches_a_log_line_or_a_reply(
+    server, app, recorder, frame, letter
+):
+    """The page chooses these strings. The log file and the window's feed do not."""
+    cookie = admitted(server)
+
+    ws = run_socket(server, app, FakeSocket([json.dumps(frame)]), cookie=cookie)
+
+    written = "\n".join(record.getMessage() for record in recorder.records)
+    answered = "\n".join(json.dumps(event) for event in ws.events)
+    assert letter * (MAX_FIELD + 1) not in written
+    assert letter * (MAX_FIELD + 1) not in answered
+
+
+# ----------------------------------------------------------------------------------
+# The server's own access log
+# ----------------------------------------------------------------------------------
+def test_the_access_log_is_silenced_so_the_ticket_never_reaches_the_console(
+    server, recorder
+):
+    """Werkzeug prints every request line, query string and all, to stderr.
+
+    That put the one secret this module has in front of anyone reading over the
+    operator's shoulder, and gave a page that cannot get in a second way to flood —
+    one our own rate limit does not cover.
+    """
+    pytest.importorskip("werkzeug")
+    # No socket: only the handler's logging is under test, and that is all it touches.
+    handler = object.__new__(server._handler_class())
+
+    assert handler.log_request(200, 17) is None
+    handler.log("info", '"GET /?t=%s HTTP/1.1" 200 -', server._ticket)
+
+    written = "\n".join(record.getMessage() for record in recorder.records)
+    assert recorder.at(logging.INFO) == []
+    assert server._ticket not in written
+    assert "?t=..." in written
+
+
+def test_a_real_request_writes_nothing_to_werkzeugs_own_logger(server):
+    """The proof that the handler is the one the running server actually uses."""
+    pytest.importorskip("flask")
+    pytest.importorskip("flask_sock")
+    watcher = Recorder()
+    werkzeug_log = logging.getLogger("werkzeug")
+    werkzeug_log.addHandler(watcher)
+    server._bound_port = 0
+    assert server.start() is True
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    try:
+        with opener.open(server.url, timeout=10) as response:
+            assert response.status == 200
+    finally:
+        server.stop()
+        werkzeug_log.removeHandler(watcher)
+
+    assert watcher.records == []
+
+
+# ----------------------------------------------------------------------------------
+# What the switches are set to
+# ----------------------------------------------------------------------------------
+def test_hello_tells_the_window_what_its_switches_are_already_set_to(
+    server, app, desk_config
+):
+    """The page read ``message.settings``, which nothing ever sent.
+
+    Every switch and slider therefore drew a guess, and the first click wrote the
+    guess into config.yaml. The same allowlist as ``set``, read in the other
+    direction: the window learns about exactly the keys it may change.
+    """
+    desk_config.set("assistant.brief_mode", True)
+    desk_config.set("tts.speed", 1.25)
+    cookie = admitted(server)
+
+    ws = run_socket(server, app, FakeSocket([]), cookie=cookie)
+
+    settings = ws.events[0]["settings"]
+    assert set(settings) == set(SETTINGS)
+    assert settings["assistant.brief_mode"] is True
+    assert settings["tts.speed"] == 1.25
+
+
+def test_hello_carries_no_setting_that_the_window_may_not_change(server, app, desk_config):
+    """A second face must not learn brain.model from a frame meant for a slider."""
+    cookie = admitted(server)
+
+    ws = run_socket(server, app, FakeSocket([]), cookie=cookie)
+
+    assert "brain.model" not in ws.events[0]["settings"]
+    assert desk_config.get("brain.model") not in json.dumps(ws.events[0]["settings"])
+
+
+def test_the_key_allowlist_and_the_value_allowlist_are_the_same_table():
+    """Two allowlists that can drift are one allowlist and one hole.
+
+    ``Assistant.apply_setting`` guards the key with its own ``DESK_SETTINGS`` and then
+    validates the value with this module's ``SETTINGS``. A key added to one and not the
+    other is either a setting the window can never change or, worse, a key that passes
+    the door and reaches the config unvalidated.
+    """
+    from jarvis.core.assistant import DESK_SETTINGS
+    from jarvis.desk.server import SETTINGS
+
+    assert set(DESK_SETTINGS) == set(SETTINGS)

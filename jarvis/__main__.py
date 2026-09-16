@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 from typing import Any
 
 #: Kept alive for the life of the process: a closed sink is worse than no sink.
@@ -42,15 +43,88 @@ def _install_null_streams() -> bool:
     stream exists. Two handles on the null device cost nothing and make the question
     go away before the first import that might ask it.
 
+    Each sink is tagged with ``NULL_STREAM_FLAG`` so that :func:`setup_logging`, which
+    runs later, can tell it apart from a real console. Untagged, a handle on the null
+    device looks like a perfectly good stream and earns a console handler that writes
+    every record to nowhere - which is precisely the sink the logging change exists to
+    avoid.
+
     Returns whether there was a console to print a banner to.
     """
+    from jarvis.core.logging import NULL_STREAM_FLAG
+
     console = sys.stdout is not None
     for name in ("stdout", "stderr"):
         if getattr(sys, name, None) is None:
             sink = open(os.devnull, "w", encoding="utf-8")
+            try:
+                setattr(sink, NULL_STREAM_FLAG, True)
+            except (AttributeError, TypeError):  # pragma: no cover - CPython allows it
+                pass
             _SINKS.append(sink)
             setattr(sys, name, sink)
     return console
+
+
+def _install_crash_hooks(logger: Any) -> None:
+    """Send every unhandled exception to the log, because there is nowhere else.
+
+    Under ``pythonw`` a traceback printed to ``sys.stderr`` goes to the null device, so
+    the launcher's message box shows the last fifteen lines of a log that never mentions
+    the crash: "JARVIS exited" and a record that stops mid-sentence. Both hooks are
+    needed - the audio, mind and desk threads die through
+    :func:`threading.excepthook`, not through :data:`sys.excepthook`.
+    """
+    previous_hook = sys.excepthook
+
+    def fall_through(exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
+        """Let the terminal have its traceback too, when there is a terminal."""
+        try:
+            previous_hook(exc_type, exc, tb)
+        except Exception:  # noqa: BLE001 - the hook of last resort may not raise
+            pass
+
+    def on_main_thread(exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            fall_through(exc_type, exc, tb)  # Ctrl+C is a decision, not a fault
+            return
+        try:
+            logger.critical("Unhandled exception in the main thread", exc_info=(exc_type, exc, tb))
+        finally:
+            fall_through(exc_type, exc, tb)
+
+    def on_other_thread(args: Any) -> None:
+        if args.exc_type is None or issubclass(args.exc_type, SystemExit):
+            return
+        thread = getattr(args, "thread", None)
+        logger.critical(
+            "Unhandled exception in thread %s", getattr(thread, "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = on_main_thread
+    threading.excepthook = on_other_thread
+
+
+def _set_app_user_model_id(app_id: str = "Jarvis.Desk", logger: Any = None) -> bool:
+    """Claim an identity in the shell before the first window exists.
+
+    Without this, every window the process opens is filed under the interpreter: the
+    taskbar and Alt-Tab show the Python logo and the name "python", which rather
+    undermines an assistant with his own icon. Windows-only, and a failure is a
+    cosmetic one - it is logged and the assistant carries on.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes  # local import: the shell API exists on Windows only
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        return True
+    except Exception:  # noqa: BLE001 - an icon is never worth a crash
+        if logger is not None:
+            logger.debug("Could not set the AppUserModelID %r", app_id, exc_info=True)
+        return False
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -120,7 +194,10 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"Could not read the configuration: {exc}", file=sys.stderr)
             return 1
-        return _overlay_test(cfg, _setup(cfg))
+        logger = _setup(cfg)
+        _install_crash_hooks(logger)
+        _set_app_user_model_id(logger=logger)
+        return _overlay_test(cfg, logger)
 
     if args.list_devices:
         from jarvis.audio.devices import print_devices
@@ -140,6 +217,9 @@ def main(argv: list[str] | None = None) -> int:
     from jarvis.core.logging import setup_logging
 
     logger = setup_logging(cfg)
+    _install_crash_hooks(logger)
+    # Before the overlay, the tray or the desk window: the shell reads it once.
+    _set_app_user_model_id(logger=logger)
 
     if args.say is not None:
         return _say_once(cfg, args.say, logger)

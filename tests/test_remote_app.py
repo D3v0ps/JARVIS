@@ -8,10 +8,14 @@ telemetry strip. All faked, no network, no Windows.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import jarvis
+from jarvis.remote import server as server_module
 from jarvis.remote.server import RemoteServer
 from jarvis.remote.session import RemoteGuard, ToolReporter
 from jarvis.tools.base import ToolResult
@@ -210,3 +214,146 @@ def test_status_survives_a_broken_scheduler(client, server):
 
     assert response.status_code == 200
     assert response.get_json()["timers"] == []
+
+
+# ----------------------------------------------------------------------------------
+# One product, two faces
+# ----------------------------------------------------------------------------------
+# The user holds the phone in front of the desk window, so a token that means one
+# thing there and another here is a visible seam. Nothing but a test keeps the two
+# pages together: they are deliberately not factored into a shared module (§24.6),
+# which is exactly why the agreement has to be asserted rather than assumed.
+def phone_page() -> str:
+    """The page as the server serves it, not a copy of it."""
+    return (Path(server_module._STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+
+
+def desk_page() -> str:
+    """The desk window's page, read straight off the package."""
+    root = Path(jarvis.__file__).resolve().parent
+    return (root / "desk" / "static" / "desk.html").read_text(encoding="utf-8")
+
+
+def wash(html: str) -> str:
+    """The ``body::before`` rule - the tinted layer that colours the whole room."""
+    match = re.search(r"body::before\s*\{(.*?)\}", html, re.S)
+    assert match, "the page no longer washes its background; this test needs rewriting"
+    return match.group(1)
+
+
+def test_the_phone_washes_its_background_with_the_state_colour():
+    """The wash is the single biggest thing making a face feel alive, and it is free.
+
+    The phone shipped with a fixed blue gradient painted into ``body``: pretty, but
+    dead - it said the same thing while he listened, worked and spoke.
+    """
+    html = phone_page()
+    layer = wash(html)
+
+    assert "var(--accent)" in layer, "the wash must follow the state, not a fixed blue"
+    assert "pointer-events: none" in layer, "the layer sits over the page; it may not eat taps"
+    assert re.search(r"body\s*\{[^}]*background:\s*var\(--bg\);", html), \
+        "the body carries the flat token now; the colour comes from the layer above it"
+    assert "rgba(41,182,246,0.10)" not in html, "the old static gradient is still there"
+
+
+def test_the_wash_brightens_while_he_listens_and_dims_while_he_is_paused():
+    """A room light that never changes brightness is wallpaper, not a state.
+
+    The desk gives the layer three opacities; a phone that only changed hue would
+    look like a colour scheme rather than an assistant paying attention.
+    """
+    html = phone_page()
+    brighter = re.search(
+        r'body\[data-state="thinking"\]::before,\s*'
+        r'body\[data-state="listening"\]::before\s*\{\s*opacity:\s*([\d.]+)', html)
+    dimmer = re.search(
+        r'body\[data-state="paused"\]::before\s*\{\s*opacity:\s*([\d.]+)', html)
+    resting = re.search(r"opacity:\s*([\d.]+); transition", wash(html))
+
+    assert brighter and dimmer and resting, "the three brightnesses are the state"
+    assert float(brighter.group(1)) > float(resting.group(1)) > float(dimmer.group(1))
+
+
+def test_both_faces_light_the_room_the_same_way():
+    """Ported from the desk verbatim: same layer, same token, same reason."""
+    for layer in (wash(phone_page()), wash(desk_page())):
+        assert "position: fixed" in layer
+        assert "var(--accent)" in layer
+        assert "pointer-events: none" in layer
+
+
+def test_the_phones_gpu_stat_reports_utilisation_like_the_desks_gpu_tile():
+    """Two faces showed two different numbers under the same word: GPU.
+
+    The desk has room for a tile each and labels them GPU and GPU degC; the phone has
+    room for one at 390 px, and utilisation is the number that moves.
+    """
+    html = phone_page()
+    call = re.search(
+        r"drawStat\(ui\.stats\.gpu,(?P<value>.*?),\s*\{(?P<flags>.*?)\}\)", html, re.S
+    )
+    assert call, "the GPU stat is no longer drawn; this test needs rewriting"
+
+    assert "util_percent" in call.group("value"), "the phone's GPU stat is utilisation"
+    assert "temperature_c" not in call.group("value"), "the heat is the warning, not the value"
+    assert "hot:" in call.group("flags"), "a hot GPU must still colour the stat"
+    assert "temp >= 80" in html, "eighty degrees is the trigger on both faces"
+
+
+def test_a_hot_gpu_is_never_reported_in_the_colour_of_good_news():
+    """Both flags live on one tile here, and ``.live`` wins the cascade over ``.hot``.
+
+    A GPU at eighty-four degrees is also busy, so without this the warning would be
+    painted cyan and read as merely lively.
+    """
+    call = re.search(
+        r"drawStat\(ui\.stats\.gpu,.*?\{(?P<flags>.*?)\}\)", phone_page(), re.S
+    )
+
+    assert re.search(r"live:\s*!hot", call.group("flags")), \
+        "live must stand down while hot is set"
+
+
+def test_both_faces_call_the_gpu_by_the_same_name():
+    """The label is what ties the phone's one tile to the desk's pair of them."""
+    assert ">GPU<" in phone_page()
+    assert ">GPU<" in desk_page()
+
+
+def test_the_phone_wears_the_dotted_wordmark():
+    """J.A.R.V.I.S. is the mark; JARVIS is a variable name.
+
+    Measured in Chromium at 390 px: 133 px wide against 306 px of header before the
+    link, so the dotted form fits with room to spare.
+    """
+    html = phone_page()
+
+    assert "<b>J.A.R.V.I.S.</b>" in html
+    assert "<b>JARVIS</b>" not in html, "the plain form is the desk's old mistake"
+
+
+def test_both_faces_wear_the_same_wordmark():
+    """Held side by side, two spellings of the name read as two products."""
+    assert "J.A.R.V.I.S." in phone_page()
+    assert "J.A.R.V.I.S." in desk_page()
+
+
+def test_a_live_stat_is_listening_cyan_on_the_phone():
+    """``.stat.live`` and the desk's ``.tile.live`` mean one thing: this is moving.
+
+    The phone shipped first and cyan is the token it shipped with, so the desk's
+    ``.tile.live`` comes to it rather than the other way round.
+    """
+    assert re.search(r"\.stat\.live \.v \{ color: var\(--listening\); \}", phone_page())
+    assert re.search(r"\.tile\.live \.v \{ color: var\(--listening\); \}", desk_page()), (
+        "the desk must use the phone's token, or the two faces drift apart again"
+    )
+
+
+def test_the_phone_still_says_call_on_a_business_card():
+    """A button on a phone that dials a number says Call. It shipped saying Call."""
+    html = phone_page()
+
+    assert '"Call " + d.phone' in html
+    assert "Ring " not in html

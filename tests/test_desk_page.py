@@ -14,6 +14,7 @@ on a CDN is a page that shows a blank rectangle instead of JARVIS.
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -62,12 +63,27 @@ def _palette(html: str) -> dict[str, str]:
 
 
 # --- self-containment -----------------------------------------------------------------
+def _fetched(tag: str) -> list[str]:
+    """What a tag would actually go and get: its ``src`` or ``href``, as written.
+
+    Read as URLs rather than searched as text, because the page carries an inline
+    SVG favicon and every SVG declares ``xmlns="http://www.w3.org/2000/svg"`` - a
+    string that looks like a fetch, is never fetched, and is not even a URL to
+    anything. What matters is the scheme of the value the browser would resolve.
+    """
+    return re.findall(r'\b(?:src|href)\s*=\s*"([^"]*)"', tag)
+
+
 def test_the_page_asks_nothing_at_all_of_the_network():
     """A window that waits on a CDN is a blank rectangle on a desk that is offline."""
     tags = re.findall(r"<(?:script|link|img|iframe)\b[^>]*>", HTML, re.I)
-    offenders = [tag for tag in tags if "http://" in tag or "https://" in tag]
+    offenders = [url for tag in tags for url in _fetched(tag)
+                 if url.startswith(("http://", "https://", "//"))]
 
     assert not offenders, f"the page fetches something: {offenders}"
+    for tag in tags:
+        for url in _fetched(tag):
+            assert url.startswith("data:"), f"{tag} fetches {url!r} instead of carrying it"
     assert not re.search(r"<script\b[^>]*\bsrc=", HTML, re.I), "the page loads an external script"
     assert "@import" not in HTML, "a stylesheet import can reach off the machine too"
     assert "url(http" not in HTML, "a CSS url() can reach off the machine too"
@@ -179,7 +195,7 @@ def test_the_title_bar_drags_the_window_but_its_buttons_do_not():
 
     assert "pywebview-drag-region" in bar, "nothing tells pywebview where to drag from"
     assert "<button" not in region, "a window button sits inside the drag region"
-    assert bar.count("<button") == 2, "the title bar is minimise and close, nothing else"
+    assert bar.count("<button") == 3, "the title bar is minimise, maximise and close"
 
 
 def test_closing_the_window_hides_it_rather_than_stopping_him():
@@ -279,3 +295,283 @@ def test_nothing_the_window_says_out_loud_is_written_for_a_machine():
     for word in ("Traceback", "undefined", "ERROR:", "null"):
         assert f">{word}" not in HTML
     assert "sir" in HTML
+
+
+# --- what the reviewers found on screen -----------------------------------------------
+def test_the_newest_line_is_scrolled_by_whatever_is_actually_overflowing():
+    """Which box scrolls depends on how wide the window is, and that is the bug.
+
+    At a desk width ``#feed`` is the element with the overflow. Narrow the window
+    past the one-column breakpoint and ``#feed`` is simply as tall as its contents
+    while ``<main>`` is the box that scrolls, so ``feed.scrollTop = feed.scrollHeight``
+    moves nothing whatsoever: his answer lands below the fold and stays there for the
+    rest of the session, which is the single worst thing a window of evidence can do.
+    """
+    assert "function scrollFeed(" in SCRIPT, "there is no helper"
+    assert "box.parentElement" in SCRIPT, "the helper never looks past the feed"
+    assert "ui.feed.scrollTop" not in SCRIPT, "something still scrolls the feed by hand"
+
+    for caller in ("function post(", "function appendReply(", "function fillCard(",
+                   "function drawWork("):
+        body = SCRIPT.split(caller, 1)[1].split("\n}", 1)[0]
+        assert "scrollFeed()" in body, f"{caller.split()[1]} never scrolls what it drew into view"
+
+
+def test_the_bar_and_the_drawer_put_back_what_they_took_from_the_feed():
+    """Both appear *above* the feed and take 90 to 180 pixels of it as they do.
+
+    Whatever was last said is then behind the composer, which is exactly when the
+    operator is being asked to approve deleting forty-one files.
+    """
+    for caller in ("function showConfirm(", "function hideConfirm("):
+        body = SCRIPT.split(caller, 1)[1].split("\n}", 1)[0]
+        assert "scrollFeed()" in body, f"{caller.split()[1]} leaves the feed where it was"
+
+    drawer = SCRIPT.split('ui.drawerToggle.addEventListener("click"', 1)[1].split("\n});", 1)[0]
+    assert "scrollFeed()" in drawer
+
+
+def test_the_feed_grows_up_from_the_composer_without_stranding_its_own_overflow():
+    """One exchange in a 450px column belongs at the bottom of it, not the top.
+
+    ``justify-content: flex-end`` is the obvious way to write that and is a trap:
+    overflow in a flex-end column goes off the *top* of the scroll box, where
+    ``scrollTop`` cannot reach it. Measured in this engine, forty lines gave
+    ``scrollHeight === clientHeight`` and a first line at -1624px - a conversation
+    that is not merely scrolled away but gone. An auto margin on the first line
+    resolves to zero as soon as the free space is negative, and both behaviours hold.
+    """
+    feed = HTML.split("  #feed {", 1)[1].split("}", 1)[0]
+
+    assert "justify-content: flex-end" not in feed, "flex-end strands everything above the fold"
+    assert "#feed > :first-child { margin-top: auto; }" in HTML
+
+
+def test_the_right_hand_column_fills_its_own_height():
+    """Four panels stacked at the top of a 700px column leave 250px of nothing.
+
+    Empty space inside a bordered panel reads as a list with room in it. The same
+    space with no panel round it reads as a page that failed to finish drawing.
+    """
+    assert ".instruments .fill {" in HTML
+    assert "flex: 1 1 auto" in HTML.split(".instruments .fill {", 1)[1].split("}", 1)[0]
+    assert '<section class="panel fill">' in HTML, "no panel is the one that grows"
+
+
+def test_the_working_line_keeps_what_was_heard_and_fades_what_it_cannot_fit():
+    """Scrolling this line to the bottom took the heard step off the top of it.
+
+    What is left is a sliced row of tool pills describing a question nobody can
+    read. The line is three rows tall, it is never scrolled for you, and a turn too
+    long for three rows says so with a fade rather than by hiding its own subject.
+    """
+    work = HTML.split("  #work {", 1)[1].split("}", 1)[0]
+
+    assert "max-height: 116px" in work, "the cap is not three rows of steps"
+    assert "ui.work.scrollTop" not in SCRIPT, "the line still scrolls its first step away"
+    assert "#work.more {" in HTML, "there is no fade for the rows that do not fit"
+    assert 'ui.work.classList.toggle("more"' in SCRIPT, "the fade is never turned on"
+
+
+def test_ordinary_narration_is_not_painted_as_a_warning():
+    """"Dialling, sir." is not a problem, and the phone draws that same line grey.
+
+    A note line that is always amber teaches the operator to ignore the one line
+    that will ever matter, so the colour is kept for the note frame and for a verb
+    that did not happen.
+    """
+    note = HTML.split("  .note {", 1)[1].split("}", 1)[0]
+
+    assert "color: var(--dim)" in note, "ordinary narration is still in the warning colour"
+    assert ".note.bad { color: var(--thinking); }" in HTML
+
+    body = SCRIPT.split("function notice(", 1)[1].split("\n}", 1)[0]
+    assert 'classList.toggle("bad"' in body
+
+    dispatch = SCRIPT.split("function onDeskMessage(", 1)[1].split("\n}", 1)[0]
+    for frame in ("note", "error", "busy"):
+        line = dispatch.split(f'case "{frame}":', 1)[1].split("break;", 1)[0]
+        assert "true" in line, f"the {frame} frame is drawn as ordinary narration"
+
+
+def test_the_scrollbar_thumb_can_actually_be_seen():
+    """Content that scrolled off looks like content that was never drawn otherwise.
+
+    At 0.16 alpha on this background the thumb is invisible, and a window whose
+    whole job is to show evidence may not hide the fact that there is more of it.
+    """
+    assert "background: rgba(41,182,246,0.38)" in HTML, "the thumb is still invisible"
+    assert "background: rgba(41,182,246,0.55)" in HTML, "the thumb does not answer the pointer"
+
+    instruments = HTML.split("\n  .instruments {", 1)[1].split("}", 1)[0]
+    assert instruments.count("#000 12px") == 2, "the column has no top mask to match the feed's"
+
+
+def test_a_short_window_shrinks_the_reactor_before_anything_else():
+    """The native window now goes down to 620px tall, and the ring is 196 of them.
+
+    Something has to give, and it is the most decorative thing on the page rather
+    than the conversation, the working line or the composer.
+    """
+    assert "@media (max-height: 700px)" in HTML
+    assert "@media (max-height: 560px)" in HTML
+
+    short = HTML.split("@media (max-height: 700px)", 1)[1].split("}", 1)[0]
+    assert "--ring: 140px" in short
+
+    shorter = HTML.split("@media (max-height: 560px)", 1)[1].split("\n  }", 1)[0]
+    assert "--ring: 108px" in shorter
+    assert ".caption" in shorter, "the caption keeps a height the window no longer has"
+
+
+def test_a_frameless_window_is_given_a_corner_to_resize_by():
+    """pywebview draws no chrome at all, so the operating system offers no border.
+
+    Without this the window is stuck at whatever size it was last given, and the
+    page is the only thing left that can offer the handle.
+    """
+    assert '<div id="grip"' in HTML
+    opening = HTML.split('<div id="grip"', 1)[1].split(">", 1)[0]
+    assert "nodrag" in opening, "the grip sits in the drag region and moves the window instead"
+
+    grip = HTML.split('<div id="grip"', 1)[1].split("</div>", 1)[0]
+    assert grip.count("<path") == 3, "a resize corner is three diagonal hairlines"
+
+    style = HTML.split("  #grip {", 1)[1].split("}", 1)[0]
+    assert "cursor: nwse-resize" in style
+
+    bar = HTML.split('<header id="bar">', 1)[1].split("</header>", 1)[0]
+    assert 'id="grip"' not in bar, "the grip is in the title bar"
+
+
+def test_the_grip_is_throttled_and_sends_what_it_was_dragged_to():
+    """A pointer moves far more often than a window can usefully be resized.
+
+    The names matter as much as the numbers: this frame is read in another file, and
+    ``w``/``h`` would be two missing fields clamped to the smallest window there is.
+    """
+    from jarvis.desk import server as server_module
+
+    assert "resize" in server_module.WINDOW_ACTIONS, "the server no longer resizes; this is stale"
+
+    body = SCRIPT.split("function gripSend(", 1)[1].split("\n}", 1)[0]
+    assert 'action: "resize"' in body
+    assert "width:" in body and "height:" in body
+    assert "window.outerWidth" in SCRIPT, "the size is not measured from the window it resizes"
+    assert "requestAnimationFrame(gripSend)" in SCRIPT, "one frame per pointer move"
+
+    reader = inspect.getsource(server_module.DeskServer._on_window)
+    assert '"width"' in reader and '"height"' in reader, "the two sides disagree on the field names"
+
+
+def test_the_title_bar_can_maximise_and_restore():
+    """Every other window on the machine does this, by button and by double-click."""
+    assert '{ type: "window", action: next ? "maximize" : "restore" }' in SCRIPT
+    assert 'ui.maxi.addEventListener("click", toggleMaximize)' in SCRIPT
+    assert 'ui.drag.addEventListener("dblclick", toggleMaximize)' in SCRIPT
+
+    bar = HTML.split('<header id="bar">', 1)[1].split("</header>", 1)[0]
+    assert bar.index('id="min"') < bar.index('id="maxi"') < bar.index('id="close"')
+
+
+def test_an_acknowledgement_that_failed_is_said_out_loud():
+    """Pressing the reactor mid-turn is answered with ok:false and nothing else.
+
+    Nothing happening is indistinguishable from a window that has quietly stopped
+    listening, so the one case where it did not work has to be spoken.
+    """
+    assert 'case "ack":' in SCRIPT
+
+    body = SCRIPT.split("function onAck(", 1)[1].split("\n}", 1)[0]
+    assert "message.ok !== false" in body, "a successful ack is not silent"
+    assert "true" in body, "a refusal is drawn as ordinary narration"
+
+    lines = SCRIPT.split("const ACK_REFUSED = {", 1)[1].split("};", 1)[0]
+    assert "I am in the middle of something, sir." in lines
+    assert "There is nothing waiting, sir." in lines
+
+
+def test_a_countdown_with_nothing_to_count_says_so():
+    """A timer whose due time never arrived rendered "NaN:NaN" on the card."""
+    body = SCRIPT.split("function countdown(", 1)[1].split("\n}", 1)[0]
+
+    assert "isFinite" in body
+    assert '"--:--"' in body
+
+
+def test_a_timer_card_with_no_end_falls_back_to_what_he_said():
+    """The due time is the one field this card exists to show.
+
+    Without it the renderer drew a dash and told ``fillCard`` it had drawn a card,
+    which suppressed the sentence that was the whole of the answer.
+    """
+    branch = SCRIPT.split('case "set_timer": {', 1)[1].split("\n    }", 1)[0]
+    guard, _, rest = branch.partition("return false;")
+
+    assert "isFinite" in guard, "the branch never checks for a due time"
+    assert "appendChild" not in guard, "the card is half drawn before it gives up"
+    assert "appendChild" in rest, "this test is looking at the wrong branch"
+
+
+def test_the_small_things_that_sat_a_pixel_out():
+    """A butler is judged on exactly this sort of thing."""
+    # HALT was 5px off the reactor's axis whenever the note line was empty.
+    assert ".note:empty { display: none; }" in HTML
+    # The countdown wrapped and took the Cancel button down with it at 880px.
+    left = HTML.split("  #confirmLeft {", 1)[1].split("}", 1)[0]
+    assert "white-space: nowrap" in left and "flex: 0 0 auto" in left
+    # The feed is selectable, and an arrow cursor over a paragraph says it is not.
+    assert ".line, .card, .lg { cursor: text; }" in HTML
+
+
+def test_the_log_and_the_filter_stay_on_the_facts_row_at_any_width():
+    """Wrapped onto a second line they move the composer up and the drawer off.
+
+    The facts are furniture and may be cut short; these two are controls.
+    """
+    facts = HTML.split('<div class="facts" id="facts">', 1)[1].split("</div>", 1)[0]
+    assert '<span class="controls-right">' in facts
+    assert facts.index("controls-right") < facts.index('id="onlyProblems"')
+    assert facts.index("controls-right") < facts.index('id="drawerToggle"')
+
+    style = HTML.split("  .facts .controls-right {", 1)[1].split("}", 1)[0]
+    assert "margin-left: auto" in style
+
+    row = HTML.split("  .facts {", 1)[1].split("}", 1)[0]
+    assert "flex-wrap: nowrap" in row
+    assert "text-overflow: ellipsis" in HTML.split("  .facts .fact {", 1)[1].split("}", 1)[0]
+
+
+def test_the_page_carries_its_own_icon():
+    """Edge's app mode gives the window a tab icon whether we provide one or not.
+
+    The one it invents is a grey globe, which is not what is running in that window.
+    """
+    icon = re.search(r'<link rel="icon"[^>]*href="([^"]*)"', HTML)
+
+    assert icon, "the window falls back to a generic icon"
+    assert icon.group(1).startswith("data:image/svg+xml,"), "the icon is not carried inline"
+    assert "%3Ccircle" in icon.group(1), "the icon is not the reactor"
+
+
+def test_the_desk_rings_a_number_the_way_the_phone_calls_one():
+    """One product does not have two words for one verb per window.
+
+    The phone shipped first and says Call, so the desk says Call.
+    """
+    phone = PHONE.read_text(encoding="utf-8")
+
+    assert '"Call " + d.phone' in phone, "the phone stopped saying Call; this test is stale"
+    assert '"Call " + d.phone' in SCRIPT
+    assert '"Ring " + d.phone' not in SCRIPT
+
+
+def test_a_tools_duration_is_rounded_before_anybody_reads_it():
+    """The assistant sends this as a float and the phone's reporter sends it whole.
+
+    The chip and the working line are the same width either way; 641.8271000003 ms
+    is not.
+    """
+    for place in ("function fillCard(", "function onTool("):
+        body = SCRIPT.split(place, 1)[1].split("\n}", 1)[0]
+        assert "Math.round(Number(ev.ms))" in body, f"{place.split()[1]} draws a raw float"

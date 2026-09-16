@@ -161,15 +161,16 @@ class Tray:
 
     # --- menu -------------------------------------------------------------------
     def _build_menu(self, pystray: Any) -> Any:
-        """Open the console (when there is one), Pause/Resume, and Quit.
+        """Open JARVIS (when there is a window), Pause/Resume, and Quit.
 
+        The word is deliberate: what this opens is the desk application, not a console.
         The window is the default item as well as the first, so a double-click on the
         icon does the thing anyone who has just minimised JARVIS wants.
         """
         items = []
         if self._on_show_window is not None:
             items.append(
-                pystray.MenuItem("Open the console", self._show_window, default=True)
+                pystray.MenuItem("Open JARVIS", self._show_window, default=True)
             )
         items.append(
             pystray.MenuItem(

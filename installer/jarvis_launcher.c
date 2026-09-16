@@ -26,8 +26,13 @@
 #define TAIL_LINES 15
 #define MESSAGE_CHARS (TAIL_BYTES + 512)
 
-/* The last TAIL_LINES lines of a UTF-8 log file, as wide text. FALSE when the
- * file cannot be read at all - which is itself something to say out loud. */
+/* The last TAIL_LINES lines of a UTF-8 log file, as wide text. `count` is the
+ * length of `out` in wide characters, not in bytes: UTF-8 never expands, so a
+ * buffer of TAIL_BYTES + 1 always holds the tail and its terminator. Pass any
+ * less and a short, all-ASCII log - the interesting case, a crash seconds after
+ * a fresh start - needs one character more than it is given and is lost
+ * entirely. FALSE when the file cannot be read at all, which is itself
+ * something to say out loud. */
 static BOOL jarvis_log_tail(const wchar_t *path, wchar_t *out, int count)
 {
     HANDLE file;
@@ -112,7 +117,7 @@ static void jarvis_report_failure(const wchar_t *dir, int code)
     wsprintfW(headline, L"JARVIS stopped unexpectedly (exit code %d).\n\n", code);
 
     if (!jarvis_join(log_path, MAX_LONG_PATH, dir, L"logs\\jarvis.log")
-        || !jarvis_log_tail(log_path, tail, TAIL_BYTES)
+        || !jarvis_log_tail(log_path, tail, TAIL_BYTES + 1)
         || tail[0] == L'\0') {
         text[0] = L'\0';
         if (jarvis_append(text, MESSAGE_CHARS, headline)) {

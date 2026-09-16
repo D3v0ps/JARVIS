@@ -11,16 +11,19 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import yaml
 
 from jarvis.config import DEFAULTS
 from jarvis.core.assistant import Assistant, _HudDispatcher, _HudFan, _Mode
-from jarvis.core.state import AssistantState
+from jarvis.core.state import AssistantState, StateBus
 from jarvis.core.wiring import build_desk
 from jarvis.ui.hud import HudModel
 from jarvis.ui.tray import Tray
@@ -34,11 +37,15 @@ class FakeBus:
 
     def __init__(self) -> None:
         self.events: list[tuple[str, dict]] = []
+        self.closed = False
 
     def publish(self, kind: str, /, **payload: object) -> tuple[str, dict]:
         event = (kind, dict(payload))
         self.events.append(event)
         return event
+
+    def close(self) -> None:
+        self.closed = True
 
     def kinds(self) -> list[str]:
         return [kind for kind, _ in self.events]
@@ -72,7 +79,11 @@ class FakeServer:
         self.bus = FakeBus()
         self.started = False
         self.stopped = False
+        self.attached: object = "never asked"
         self._starts = starts
+
+    def attach_window(self, window: object) -> None:
+        self.attached = window
 
     def start(self) -> bool:
         self.started = self._starts
@@ -85,16 +96,34 @@ class FakeServer:
 class FakeWindow:
     """A DeskWindow that hosts nothing, and remembers what it was asked to do."""
 
-    def __init__(self, cfg=None, url: str = "", *, logger=None, on_close=None,
-                 needs_main_thread: bool = False, shows: bool = True) -> None:
+    def __init__(self, cfg=None, url="", *, logger=None, on_close=None,
+                 needs_main_thread: bool = False, shows: bool = True,
+                 hosts: str = "edge") -> None:
         self.cfg = cfg
-        self.url = url
+        #: The real DeskWindow takes a string *or* something to ask, and asks afresh at
+        #: every open because the ticket in the URL is single-use. The fake has to do the
+        #: same, or it would pass a callable off as an address and prove nothing.
+        self.url_source = url
+        self.on_close = on_close
         self.needs_main_thread = needs_main_thread
         self.started = 0
         self.shown = 0
         self.ran = 0
         self.stopped = 0
         self._shows = shows
+        #: Which host in the chain this machine would win with, for the probe below.
+        self._hosts = hosts
+
+    @property
+    def url(self) -> str:
+        source = self.url_source
+        return str((source() if callable(source) else source) or "")
+
+    def _order(self) -> tuple[str, ...]:
+        return ("webview", "edge", "browser")
+
+    def _probe(self, name: str) -> bool:
+        return name == self._hosts
 
     def start(self) -> bool:
         self.started += 1
@@ -191,6 +220,38 @@ class FakeDispatcher:
 
     def tools_payload(self) -> list[dict]:
         return []
+
+
+class CardDispatcher:
+    """A dispatcher whose results have a card in them - including what must not be drawn."""
+
+    def execute(self, name: str, args: dict):
+        return SimpleNamespace(
+            ok=True,
+            refused=False,
+            summary="The Eagle, 020 7946 0991",
+            data={
+                "name": "The Eagle",
+                "phone": "020 7946 0991",
+                # Neither key is on the phone's list, and neither belongs on a page:
+                # one is raw shell output, the other is where the operator keeps things.
+                "stdout": "PS C:\\Users\\karim> Get-Process",
+                "path": "C:\\Users\\karim\\Documents\\taxes.xlsx",
+            },
+        )
+
+    def tools_payload(self) -> list[dict]:
+        return []
+
+
+class FakeTray:
+    """The icon, with the one method anything outside it ever calls."""
+
+    def __init__(self) -> None:
+        self.states: list[AssistantState] = []
+
+    def on_state(self, state: AssistantState) -> None:
+        self.states.append(state)
 
 
 class FakeBrain:
@@ -296,6 +357,10 @@ def test_build_desk_points_the_window_at_the_servers_url(desk_config, desk_packa
 
     assert server.started is True
     assert window.url == FakeServer.url, "the window must open the door the server opened"
+    assert callable(window.url_source), (
+        "the window must ask for the URL at every open: the ticket in it is single-use, "
+        "so a link captured at build time is refused by our own front door an hour later"
+    )
     assert window.started == 1
 
 
@@ -336,6 +401,105 @@ def test_build_desk_builds_the_window_it_does_not_open(desk_config, desk_package
     assert window is not None and window.started == 0
 
 
+def test_build_desk_hands_the_server_the_window(desk_config, desk_package):
+    """The page's own title bar minimises and closes, and only the server hears the page."""
+    desk_config.set("ui.window", True)
+
+    server, window = build_desk(desk_config, object(), logging.getLogger("test"))
+
+    assert server.attached is window
+
+
+def test_build_desk_survives_a_server_that_takes_no_window(desk_config, desk_package,
+                                                           monkeypatch):
+    """attach_window is arriving in another file; start-up must not wait for it."""
+    class Older(FakeServer):
+        attach_window = None
+
+    desk_config.set("ui.window", True)
+    monkeypatch.setattr(desk_package, "DeskServer", Older, raising=False)
+
+    server, window = build_desk(desk_config, object(), logging.getLogger("test"))
+
+    assert server is not None and window is not None
+
+
+def test_a_webview_window_is_created_at_start_whatever_the_setting_says(
+    desk_config, desk_package, monkeypatch, caplog
+):
+    """pywebview can only be created on the main thread, and the tray clicks far too late.
+
+    By then thread one is inside run_forever. open_window_on_start: false on a machine
+    where WebView2 wins the chain therefore meant Open JARVIS could never open
+    anything at all; opening it now is much the smaller surprise, and it is logged.
+    """
+    desk_config.set("ui.window", True)
+    desk_config.set("ui.open_window_on_start", False)
+    monkeypatch.setattr(
+        desk_package, "DeskWindow",
+        lambda *a, **k: FakeWindow(*a, hosts="webview", **k), raising=False,
+    )
+
+    with caplog.at_level(logging.INFO, logger="test"):
+        _server, window = build_desk(desk_config, object(), logging.getLogger("test"))
+
+    assert window.started == 1
+    assert any("main thread" in record.message for record in caplog.records)
+
+
+def test_a_window_hosted_by_edge_still_waits_in_the_tray(desk_config, desk_package):
+    """Edge and the browser are separate processes and can be started from anywhere."""
+    desk_config.set("ui.window", True)
+    desk_config.set("ui.open_window_on_start", False)
+
+    _server, window = build_desk(desk_config, object(), logging.getLogger("test"))
+
+    assert window.started == 0
+
+
+def test_a_host_that_cannot_be_probed_is_not_assumed_to_want_the_main_thread(
+    desk_config, desk_package, monkeypatch
+):
+    """An unanswerable question is a no; guessing yes would open a window nobody asked for."""
+    class Silent(FakeWindow):
+        def _probe(self, name: str) -> bool:
+            raise RuntimeError("the registry is not answering")
+
+    desk_config.set("ui.window", True)
+    desk_config.set("ui.open_window_on_start", False)
+    monkeypatch.setattr(desk_package, "DeskWindow", Silent, raising=False)
+
+    _server, window = build_desk(desk_config, object(), logging.getLogger("test"))
+
+    assert window.started == 0
+
+
+def test_closing_the_window_tells_the_tray_and_says_where_it_went(
+    desk_config, desk_package, caplog
+):
+    """Closing hides into the tray rather than quitting, which looks exactly like a crash."""
+    desk_config.set("ui.window", True)
+    tray = FakeTray()
+    assistant = SimpleNamespace(tray=tray, state=StateBus())
+
+    _server, window = build_desk(desk_config, assistant, logging.getLogger("test"))
+    with caplog.at_level(logging.INFO, logger="test"):
+        window.on_close()
+
+    assert tray.states == [AssistantState.IDLE]
+    assert any("tray" in record.message.lower() for record in caplog.records)
+
+
+def test_closing_the_window_before_there_is_a_tray_is_quiet(desk_config, desk_package):
+    """--no-ui leaves no tray at all, and the close hook must not care."""
+    desk_config.set("ui.window", True)
+
+    _server, window = build_desk(desk_config, SimpleNamespace(tray=None, state=None),
+                                 logging.getLogger("test"))
+
+    assert window.on_close() is None
+
+
 # --- the fan -------------------------------------------------------------------------
 def test_a_tool_call_reaches_both_the_overlay_and_the_window():
     """The whole reason the fan exists: one narration, two faces, no second call site."""
@@ -362,6 +526,62 @@ def test_a_tool_run_through_the_dispatcher_reaches_both(desk_config):
 
     assert [event.name for event in hud.tools] == ["get_time_date"]
     assert bus.kinds() == ["tool", "tool"]
+
+
+def test_a_finished_tool_carries_the_summary_and_the_data_the_card_is_made_of():
+    """Every card in § 24.6 is drawn from these two fields; without them the page is blank."""
+    bus = FakeBus()
+    dispatcher = _HudDispatcher(CardDispatcher(), _HudFan(HudModel(), bus))
+
+    dispatcher.execute("find_place", {})
+
+    payload = bus.payloads("tool")[-1]
+    assert payload["phase"] == "end"
+    assert payload["summary"] == "The Eagle, 020 7946 0991"
+    assert payload["data"]["name"] == "The Eagle"
+    assert payload["data"]["phone"] == "020 7946 0991"
+
+
+def test_a_key_the_phone_would_not_send_never_reaches_the_page():
+    """The desk decides what JARVIS may do, not what a web page may be handed.
+
+    Raw PowerShell output and a path into the operator's documents are exactly what a
+    card renderer would happily draw, and neither has any business leaving the process.
+    """
+    bus = FakeBus()
+    dispatcher = _HudDispatcher(CardDispatcher(), _HudFan(HudModel(), bus))
+
+    dispatcher.execute("run_powershell", {})
+
+    data = bus.payloads("tool")[-1]["data"]
+    assert "stdout" not in data
+    assert "path" not in data
+    assert set(data) == {"name", "phone"}
+
+
+def test_the_overlays_own_model_is_never_offered_a_card():
+    """HudModel.tool_finished has four parameters and the ring has nowhere to draw one.
+
+    Passing the card to it would be a TypeError on every guarded tool on a machine
+    with no window, which is most of the ways JARVIS gets run.
+    """
+    hud = HudModel()
+    dispatcher = _HudDispatcher(CardDispatcher(), hud)
+
+    dispatcher.execute("find_place", {})
+
+    assert [event.name for event in hud.tools] == ["find_place"]
+    assert hud.tools[0].done is True
+
+
+def test_a_tool_with_nothing_to_show_still_reaches_the_window():
+    """Most tools have no card. An absent summary is an empty one, never a missing key."""
+    bus = FakeBus()
+    _HudFan(None, bus).tool_finished("set_volume", ok=True, duration_ms=3.0)
+
+    payload = bus.payloads("tool")[-1]
+    assert payload["summary"] == ""
+    assert payload["data"] == {}
 
 
 def test_the_fan_carries_what_was_heard_and_every_sentence():
@@ -488,21 +708,54 @@ def test_arming_the_microphone_takes_the_wake_words_own_path(assistant):
     """Chime, acknowledgement and follow-up window: a button that skipped them would lie."""
     assert assistant.arm_listening() is True
 
+    assistant._route(np.zeros(320, dtype=np.float32))
+
     assert assistant._mode is _Mode.LISTENING
     assert assistant.state.state is AssistantState.LISTENING
     assert assistant.parts.speaker.chimes == 1
     assert assistant.parts.speaker.said == ["Sir?"]
 
 
+def test_arming_touches_nothing_on_the_windows_own_thread(assistant):
+    """Waking up flushes the microphone, resets the segmenter and resets the detector.
+
+    All three belong to the capture loop and are in use at that instant, so the
+    websocket reader may only leave a flag behind - the way _stop_turn is left.
+    """
+    flushes = assistant.parts.mic.flushes
+
+    assert assistant.arm_listening() is True
+
+    assert assistant._arm_request.is_set() is True
+    assert assistant._mode is _Mode.IDLE
+    assert assistant.parts.mic.flushes == flushes
+    assert assistant.parts.speaker.chimes == 0
+
+
+def test_an_arming_request_he_has_outrun_is_dropped(assistant):
+    """He woke on his own between the click and the next frame; two wakes is a stammer."""
+    assistant.arm_listening()
+    assistant._to_listening()
+    assistant.parts.speaker.chimes = 0
+
+    assistant._route(np.zeros(320, dtype=np.float32))
+
+    assert assistant.parts.speaker.chimes == 0
+    assert assistant._mode is _Mode.LISTENING
+    assert assistant._arm_request.is_set() is False
+
+
 def test_arming_is_refused_while_he_is_paused(assistant):
     assistant.pause()
 
     assert assistant.arm_listening() is False
+    assert assistant._arm_request.is_set() is False
     assert assistant._mode is _Mode.IDLE
 
 
 def test_arming_is_refused_when_he_is_already_listening(assistant):
     assistant.arm_listening()
+    assistant._route(np.zeros(320, dtype=np.float32))
     assistant.parts.speaker.chimes = 0
 
     assert assistant.arm_listening() is False
@@ -533,55 +786,186 @@ def test_aborting_survives_a_speaker_that_will_not_stop(assistant):
 # --- the six hooks: confirmation -----------------------------------------------------
 def test_a_confirmation_from_the_window_answers_the_guarded_tool(assistant):
     """The click has to arrive as a word, because the answer is read as one."""
-    assistant._mode = _Mode.CONFIRMING
-    assistant._confirm_ready.clear()
+    token, ready = assistant._open_confirmation()
 
     assert assistant.answer_confirmation(True) is True
-    assert assistant._confirm_ready.is_set() is True
+    assert ready.is_set() is True
 
     from jarvis.tools.safety import is_cancellation, is_confirmation
 
-    assert is_confirmation(assistant._confirm_reply) is True
-    assert is_cancellation(assistant._confirm_reply) is False
+    reply = assistant._close_confirmation(token, _Mode.WORKING)
+    assert is_confirmation(reply) is True
+    assert is_cancellation(reply) is False
 
 
 def test_cancelling_from_the_window_reads_as_a_refusal(assistant):
-    assistant._mode = _Mode.CONFIRMING
-    assistant._confirm_ready.clear()
+    token, _ready = assistant._open_confirmation()
 
     assert assistant.answer_confirmation(False) is True
 
     from jarvis.tools.safety import is_cancellation, is_confirmation
 
-    assert is_confirmation(assistant._confirm_reply) is False
-    assert is_cancellation(assistant._confirm_reply) is True
+    reply = assistant._close_confirmation(token, _Mode.WORKING)
+    assert is_confirmation(reply) is False
+    assert is_cancellation(reply) is True
 
 
 def test_a_confirmation_nobody_asked_for_is_refused(assistant):
+    """A click with nothing pending must not be remembered and spent on the next tool."""
     assert assistant._mode is _Mode.IDLE
 
     assert assistant.answer_confirmation(True) is False
-    assert assistant._confirm_ready.is_set() is False
+    assert assistant._confirm_id == 0
+    assert assistant._confirm_reply is None
+    assert assistant._confirm_ready is None
+
+
+def test_an_answer_meant_for_a_finished_confirmation_is_not_kept(assistant):
+    """The tool timed out and stopped listening; the click that follows belongs to nobody."""
+    token, _ready = assistant._open_confirmation()
+    assistant._close_confirmation(token, _Mode.WORKING)
+
+    assert assistant.answer_confirmation(True) is False
+    assert assistant._settle_confirmation("confirm", source="the microphone") is False
 
 
 def test_the_spoken_answer_wins_when_it_lands_first(assistant):
     """He said no and then reached for the button: the first answer is the one he meant."""
-    assistant._mode = _Mode.CONFIRMING
-    assistant._confirm_ready.clear()
+    token, _ready = assistant._open_confirmation()
     assistant._settle_confirmation("cancel", source="the microphone")
 
     assert assistant.answer_confirmation(True) is False
-    assert assistant._confirm_reply == "cancel"
+    assert assistant._close_confirmation(token, _Mode.WORKING) == "cancel"
 
 
 def test_the_window_wins_when_it_lands_first(assistant):
     """And the same race the other way round, because the microphone is still open."""
-    assistant._mode = _Mode.CONFIRMING
-    assistant._confirm_ready.clear()
+    token, _ready = assistant._open_confirmation()
     assistant.answer_confirmation(False)
 
     assert assistant._settle_confirmation("confirm", source="the microphone") is False
-    assert assistant._confirm_reply == "cancel"
+    assert assistant._close_confirmation(token, _Mode.WORKING) == "cancel"
+
+
+def test_a_guarded_tool_in_a_desk_turn_gives_the_ear_back(assistant, monkeypatch):
+    """A desk turn is not a microphone turn, and nothing downstream puts the mode back.
+
+    Ending every confirmation in WORKING left _route watching for barge-in for the
+    rest of the session: no wake word, no follow-up window, and the window's own
+    Listen button refused until JARVIS was restarted.
+    """
+    assistant.confirmation_timeout = 0.01
+    monkeypatch.setattr(assistant.parts.segmenter, "reset", lambda: None)
+    assert assistant._mode is _Mode.IDLE
+
+    assert assistant._tool_confirm("I am about to run PowerShell, sir.") is False
+
+    assert assistant._mode is _Mode.IDLE
+    assert assistant.state.state is AssistantState.IDLE
+    assert assistant.arm_listening() is True, "the Listen button must still be alive"
+
+
+def test_a_guarded_tool_in_a_spoken_turn_still_ends_in_working(assistant, monkeypatch):
+    """The voice path is the one this always got right, and it must go on getting it right."""
+    assistant.confirmation_timeout = 0.01
+    monkeypatch.setattr(assistant.parts.segmenter, "reset", lambda: None)
+    assistant._mode = _Mode.WORKING
+
+    assistant._tool_confirm("I am about to delete that file, sir.")
+
+    assert assistant._mode is _Mode.WORKING
+    assert assistant.state.state is AssistantState.THINKING
+
+
+def test_a_guarded_tool_asked_mid_conversation_leaves_him_listening(assistant, monkeypatch):
+    """A timer firing inside the follow-up window is the third caller, and the third mode."""
+    assistant.confirmation_timeout = 0.01
+    monkeypatch.setattr(assistant.parts.segmenter, "reset", lambda: None)
+    assistant._to_listening()
+
+    assistant._tool_confirm("I am about to close that, sir.")
+
+    assert assistant._mode is _Mode.LISTENING
+    assert assistant.state.state is AssistantState.LISTENING
+
+
+def test_one_confirmation_cannot_grant_two_guarded_tools(assistant, monkeypatch):
+    """A routine walks its calls on the socket's reader thread while the worker waits.
+
+    With one unnamed slot between them, a single "confirm" ran both tools: the one the
+    operator was answering, and one he had not been told about. Each question now has
+    an id of its own and queues behind the last, so an answer can only spend itself once.
+    """
+    assistant.confirmation_timeout = 1.0
+    monkeypatch.setattr(assistant.parts.segmenter, "reset", lambda: None)
+    granted: list[bool] = []
+    guard = threading.Lock()
+
+    def ask() -> None:
+        answer = assistant._tool_confirm("I am about to run PowerShell, sir.")
+        with guard:
+            granted.append(answer)
+
+    askers = [threading.Thread(target=ask, name=f"guarded-{n}") for n in range(2)]
+    for asker in askers:
+        asker.start()
+    deadline = time.monotonic() + 5.0
+    while assistant._confirm_id == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    # Both tools are in flight; the second is given every chance to reach a wait of
+    # its own beside the first before the one answer is given. Well inside the
+    # timeout, so the question that is genuinely pending is still pending.
+    time.sleep(0.15)
+
+    assert assistant.answer_confirmation(True) is True, "one question was waiting"
+
+    for asker in askers:
+        asker.join(timeout=5.0)
+        assert not asker.is_alive(), "a guarded tool waited for ever"
+
+    assert sorted(granted) == [False, True], "the other must reach its own timeout"
+
+
+def test_a_second_guarded_tool_waits_rather_than_replacing_the_first(assistant, monkeypatch):
+    """Two confirmation bars at once is not a state the window can express.
+
+    The gate is what makes the second tool queue. Without it the second call mints a
+    slot over the first, and the first then waits out a question that nobody - not the
+    window, not the microphone - is able to answer any more.
+    """
+    assistant.confirmation_timeout = 0.05
+    monkeypatch.setattr(assistant.parts.segmenter, "reset", lambda: None)
+    pending, most, guard = 0, 0, threading.Lock()
+    really_open, really_close = assistant._open_confirmation, assistant._close_confirmation
+
+    def opened():
+        nonlocal pending, most
+        with guard:
+            pending += 1
+            most = max(most, pending)
+        return really_open()
+
+    def closed(token, previous):
+        nonlocal pending
+        with guard:
+            pending -= 1
+        return really_close(token, previous)
+
+    monkeypatch.setattr(assistant, "_open_confirmation", opened)
+    monkeypatch.setattr(assistant, "_close_confirmation", closed)
+
+    askers = [
+        threading.Thread(target=assistant._tool_confirm, args=("I am about to restart, sir.",))
+        for _ in range(3)
+    ]
+    for asker in askers:
+        asker.start()
+    for asker in askers:
+        asker.join(timeout=5.0)
+        assert not asker.is_alive(), "a guarded tool waited for ever"
+
+    assert most == 1, "a second question was opened while the first was still pending"
+    assert assistant._confirm_id == 0, "the slot is retired with the question"
 
 
 # --- the six hooks: routines ---------------------------------------------------------
@@ -654,6 +1038,41 @@ def test_a_setting_that_cannot_be_applied_is_still_saved(assistant):
 
     assert assistant.apply_setting("tts.speed", 0.9) is True
     assert assistant.cfg.get("tts.speed") == 0.9
+
+
+def test_a_value_the_window_would_never_send_is_refused(assistant):
+    """The key allowlist says which slider; only the value table says what a slider means.
+
+    Checking the key and waving the value through meant a frame that reached
+    apply_setting by any other route could put a word, a list or NaN into config.yaml
+    and JARVIS would read it back on the next start.
+    """
+    before = assistant.cfg.get("tts.speed")
+
+    assert assistant.apply_setting("tts.speed", "quickly") is False
+    assert assistant.apply_setting("wake.sensitivity", float("nan")) is False
+    assert assistant.apply_setting("assistant.brief_mode", [1, 2]) is False
+
+    assert assistant.cfg.get("tts.speed") == before
+
+
+def test_a_slider_pushed_past_its_end_is_pinned_rather_than_refused(assistant):
+    """The table clamps on purpose: 40 means "as fast as you go", not "fail"."""
+    assert assistant.apply_setting("tts.speed", 40) is True
+
+    assert assistant.cfg.get("tts.speed") == 1.6
+    assert assistant.parts.speaker._engine.speed == 1.6
+
+
+def test_a_config_that_could_not_be_written_is_not_reported_as_saved(assistant):
+    """Config.save returns False for a read-only file, and the window is owed the truth.
+
+    Answering the ack anyway is how an operator ends up moving the same slider three
+    times and then restarting to find out none of it took.
+    """
+    assistant.cfg.save = lambda: False
+
+    assert assistant.apply_setting("tts.speed", 1.1) is False
 
 
 # --- the main thread -----------------------------------------------------------------
@@ -762,6 +1181,28 @@ def test_stopping_lets_go_of_the_log_and_the_state_bus(
     assert built.state.observer_count < observers
 
 
+def test_stopping_closes_the_window_s_bus(
+    desk_config, desk_package, desk_bus_module, monkeypatch
+):
+    """Nothing ever closed it, so every subscriber queue stayed open past shutdown.
+
+    The page reads an open queue as a live JARVIS and reconnects to it for the rest of
+    the machine's day; closing is also what releases the replay buffer.
+    """
+    desk_config.set("ui.window", True)
+    monkeypatch.setattr("jarvis.core.wiring.build_face", lambda *a, **k: (None, None))
+
+    built = Assistant(desk_config, text_mode=False)
+    built.parts.speaker = FakeSpeaker()
+    built.parts.mic = FakeMic()
+    built.start()
+    bus = built.desk.bus
+    built.stop()
+
+    assert bus.closed is True
+    assert built._desk_bus is None
+
+
 def test_the_window_is_told_about_a_guarded_tool_and_its_answer(assistant, monkeypatch):
     """The confirmation bar and the spoken window open and close together."""
     bus = FakeBus()
@@ -818,7 +1259,8 @@ def test_the_tray_offers_the_window_and_still_pauses_and_quits():
     labels = [item.text for item in menu.items]
     menu.items[0].action(None, None)
 
-    assert labels[0] == "Open the console"
+    # "the console" is the word this whole feature exists to stop using.
+    assert labels[0] == "Open JARVIS"
     assert labels[-1] == "Quit"
     assert len(labels) == 3
     assert menu.items[0].kwargs.get("default") is True

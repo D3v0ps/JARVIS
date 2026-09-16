@@ -223,8 +223,10 @@ What is in it:
 | **A composer** | type instead of talking; same brain, same tools |
 | **A log drawer** | collapsed, for when something has gone wrong |
 
-Closing the window hides it to the tray; **right-click the tray icon → Open the console**
+Closing the window hides it to the tray; **right-click the tray icon → Open JARVIS**
 brings it back. He keeps listening either way — the window is a face, not a switch.
+Minimise and maximise are in the title bar, and the window is resized by the grip in its
+bottom-right corner: it has no Windows chrome at all, so it grew its own.
 
 **How it is drawn.** The window is a web page rendered by Edge WebView2, which is
 already part of Windows 11. That is why it looks like the phone app: it *is* the same
