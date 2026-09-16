@@ -26,7 +26,10 @@ import numpy as np
 
 from jarvis.core.state import AssistantState
 
-__all__ = ["ReactorTheme", "ReactorRenderer", "STATE_STYLES", "StateStyle"]
+__all__ = [
+    "ReactorTheme", "ReactorRenderer", "STATE_STYLES", "StateStyle",
+    "BOOT_SECONDS", "blend_styles",
+]
 
 # --- geometry, as fractions of the half-width ----------------------------------------
 CORE_R = 0.150          # the white-hot centre
@@ -39,6 +42,16 @@ HALO_OUT = 1.000        # soft falloff to nothing
 
 COIL_COUNT = 8
 COIL_GAP = 0.20         # fraction of each segment that is dark
+
+# --- the boot sweep -------------------------------------------------------------------
+#: How long the iris takes to open, in seconds. The brief caps the whole boot animation
+#: at three seconds and starts the wake-word thread first, so this is the visible part
+#: of a startup that is already listening before it has finished drawing itself.
+BOOT_SECONDS = 1.2
+
+#: Where in the boot the core starts coming up. The coils open first and the core
+#: arrives last, which is the order the thing would light in if it were real.
+_BOOT_CORE_START = 0.55
 
 
 def _hex_to_rgb(value: str) -> tuple[float, float, float]:
@@ -157,8 +170,21 @@ class ReactorRenderer:
         return (rise * fall).astype(np.float32)
 
     # --- per-frame -------------------------------------------------------------------
-    def _coils(self, t: float, style: StateStyle, levels: Sequence[float] | None) -> np.ndarray:
-        """The eight coils: lit evenly, sweeping like a comet, or riding the audio."""
+    def _coils(
+        self,
+        t: float,
+        style: StateStyle,
+        levels: Sequence[float] | None,
+        *,
+        mask: np.ndarray | None = None,
+        lit_count: int = COIL_COUNT,
+    ) -> np.ndarray:
+        """The eight coils: lit evenly, sweeping like a comet, or riding the audio.
+
+        ``mask`` overrides the static coil band - the boot sweep passes a narrower ring
+        so the iris can open outward. ``lit_count`` darkens every coil from that index
+        on, which is how the ring fills in one segment at a time during the boot.
+        """
         angle = self._theta + math.tau * (style.spin * t)
         position = (angle / math.tau) % 1.0                  # 0..1 around the ring
         segment = position * COIL_COUNT
@@ -199,7 +225,12 @@ class ReactorRenderer:
                 (1.0 - style.reactive) + style.reactive * modulation
             ).astype(np.float32)
 
-        return (self._coil_mask * lit * brightness).astype(np.float32)
+        if lit_count < COIL_COUNT:
+            # Whole segments, not a fade: a half-lit coil looks like a rendering bug.
+            brightness = brightness * (index < max(0, lit_count)).astype(np.float32)
+
+        band = self._coil_mask if mask is None else mask
+        return (band * lit * brightness).astype(np.float32)
 
     def render(
         self,
@@ -209,12 +240,20 @@ class ReactorRenderer:
         amplitude: float = 0.0,
         levels: Sequence[float] | None = None,
         style: StateStyle | None = None,
+        boot_t: float | None = None,
     ) -> np.ndarray:
         """One frame as ``(size, size, 4)`` uint8 RGBA, straight alpha.
 
         ``t`` is seconds since the overlay started; ``amplitude`` is the current
         audio level (0..1) and ``levels`` an optional short history mapped around
         the ring.
+
+        ``boot_t`` is seconds since the boot sweep began, or ``None`` for the settled
+        ring. While it is below :data:`BOOT_SECONDS` the iris opens: the coil ring
+        grows outward from the centre, the coils light one at a time from none to all
+        eight, and the core comes up last. At ``boot_t >= BOOT_SECONDS`` this returns
+        exactly the frame it would have returned for ``boot_t=None``, so the animation
+        has no seam where it hands over to the live ring.
         """
         style = style or self.theme.style(state)
         rgb = np.array(_hex_to_rgb(style.color), dtype=np.float32)
@@ -226,16 +265,32 @@ class ReactorRenderer:
         intensity += 0.22 * float(np.clip(amplitude, 0.0, 1.0)) * style.reactive
         intensity = float(np.clip(intensity, 0.0, 1.35))
 
-        coils = self._coils(t, style, levels)
+        core_gain, ring_gain = 1.0, 1.0
+        coil_mask: np.ndarray | None = None
+        lit_count = COIL_COUNT
+        if boot_t is not None and float(boot_t) < BOOT_SECONDS:
+            # The iris: an eased 0..1 over the boot. Everything below is exactly 1.0 or
+            # the static mask once this branch is skipped, so a settled frame is
+            # bit-for-bit what it was before the boot sweep existed.
+            progress = max(0.0, float(boot_t)) / BOOT_SECONDS
+            eased = progress * progress * (3.0 - 2.0 * progress)
+            coil_mask = self._band(COIL_IN * eased, COIL_OUT * eased)
+            lit_count = int(math.ceil(progress * COIL_COUNT))
+            ring_gain = eased
+            core_gain = float(
+                _smoothstep(_BOOT_CORE_START, 1.0, np.asarray(progress, dtype=np.float32))
+            )
+
+        coils = self._coils(t, style, levels, mask=coil_mask, lit_count=lit_count)
 
         # Brightness of each layer, in "light units" that are summed then tone-mapped.
         light = (
-            self._core * 1.55
-            + self._core_bloom * 0.42
-            + self._inner_ring * 1.05
+            self._core * 1.55 * core_gain
+            + self._core_bloom * 0.42 * core_gain
+            + self._inner_ring * 1.05 * ring_gain
             + coils * 1.20
-            + self._rim * 0.70
-            + self._halo * 0.38
+            + self._rim * 0.70 * ring_gain
+            + self._halo * 0.38 * ring_gain
         ) * intensity
 
         if style.pulse > 0.0:
@@ -252,7 +307,9 @@ class ReactorRenderer:
             light = light + wave * amount * style.pulse * self._disc
 
         # The core reads white-hot while the rest keeps the state's colour.
-        whiteness = np.clip(self._core * 1.25 + self._core_bloom * 0.18, 0.0, 1.0)[..., None]
+        whiteness = np.clip(
+            (self._core * 1.25 + self._core_bloom * 0.18) * core_gain, 0.0, 1.0
+        )[..., None]
         colour = rgb[None, None, :] * (1.0 - whiteness) + np.float32(1.0) * whiteness
 
         # Filmic-ish tone map: bright areas bloom toward white instead of clipping.

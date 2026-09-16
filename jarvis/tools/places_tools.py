@@ -6,18 +6,16 @@ he says so.
 
 Order of attack: Nominatim (``extratags`` carries ``phone``, ``contact:phone``,
 ``website``, ``opening_hours``), then Overpass for a category around that point, then
-the existing ``ddgs`` search plus a plain ``requests.get`` on the business's own site,
-scanned for ``tel:`` links and phone-shaped text. Most Swedish dentists and barbers
-carry no phone tag in OSM, so the last step carries most lookups - that goes in the
-log, not out loud. Both OSM services are throttled by a module-level rate limiter
-(Nominatim allows one request per second, Overpass gives anonymous callers two slots)
-and sent a descriptive ``User-Agent``, as their terms require. ``hitta.se`` and
-``eniro.se`` have better data and forbid this, so they are never touched.
-
-Numbers are normalised to E.164 with :mod:`phonenumbers` when it is installed (offline)
-and with a conservative regex when it is not. Hits cache to ``places.json`` beside
-``memory.json``, so a barber is looked up once, ever. Only ``requests`` is imported at
-module level, so this module imports on a bare Linux box.
+the existing ``ddgs`` search plus a ``requests.get`` on the business's own site, scanned
+for ``tel:`` links and phone-shaped text. Most Swedish dentists and barbers carry no
+phone tag in OSM, so the last step carries most lookups - that goes in the log, not out
+loud. Both OSM services are throttled by a module-level rate limiter (Nominatim allows
+one request a second, Overpass gives anonymous callers two slots) and sent a descriptive
+``User-Agent``, as their terms require. ``hitta.se`` and ``eniro.se`` forbid this, so
+they are never touched. Numbers are normalised to E.164 with :mod:`phonenumbers` when it
+is installed (offline) and with a conservative regex when it is not, and hits cache to
+``places.json`` beside ``memory.json`` so a barber is looked up once, ever. Only
+``requests`` is imported at module level, so this module imports on a bare Linux box.
 """
 
 from __future__ import annotations
@@ -74,28 +72,27 @@ _DIGITS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight
 
 #: Country calling codes for the fallback used when ``phonenumbers`` is absent.
 COUNTRY_CODES: dict[str, str] = {
-    "SE": "46", "NO": "47", "DK": "45", "FI": "358", "IS": "354", "EE": "372",
-    "DE": "49", "GB": "44", "IE": "353", "NL": "31", "BE": "32", "FR": "33",
-    "ES": "34", "PT": "351", "IT": "39", "PL": "48", "AT": "43", "CH": "41",
-    "US": "1", "CA": "1",
+    "SE": "46", "NO": "47", "DK": "45", "FI": "358", "IS": "354", "EE": "372", "DE": "49",
+    "GB": "44", "IE": "353", "NL": "31", "BE": "32", "FR": "33", "ES": "34", "PT": "351",
+    "IT": "39", "PL": "48", "AT": "43", "CH": "41", "US": "1", "CA": "1",
 }
 
 #: Spoken category -> the OSM tag Overpass matches on, English and Swedish.
 CATEGORY_TAGS: dict[str, str] = {
-    word: tag
-    for tag, words in {
+    word: tag for tag, words in {
         "amenity=dentist": ("dentist", "dentists", "tandlakare", "tandläkare"),
         "shop=hairdresser": ("hairdresser", "barber", "frisor", "frisör"),
-        "amenity=pharmacy": ("pharmacy", "apotek"),
+        "amenity=pharmacy": ("pharmacy", "apotek"), "shop=optician": ("optician", "optiker"),
         "amenity=doctors": ("doctor", "doctors", "lakare", "läkare"),
         "amenity=clinic": ("clinic", "vardcentral", "vårdcentral"),
         "amenity=restaurant": ("restaurant", "restaurang"),
         "amenity=veterinary": ("vet", "veterinary", "veterinar", "veterinär"),
-        "shop=optician": ("optician", "optiker"),
         "shop=car_repair": ("garage", "bilverkstad"),
-    }.items()
-    for word in words
+    }.items() for word in words
 }
+
+#: Directories with better data whose terms forbid this: never fetched, never quoted.
+BLOCKED_HOSTS = ("hitta.se", "eniro.se", "ratsit.se", "merinfo.se", "birthday.se")
 
 _DAY_WORDS = {"mo": "Monday", "tu": "Tuesday", "we": "Wednesday", "th": "Thursday",
               "fr": "Friday", "sa": "Saturday", "su": "Sunday", "ph": "public holidays"}
@@ -138,9 +135,8 @@ def _spoken_list(names: list[str]) -> str:
 class _RateLimiter:
     """Blocks until ``min_interval`` has passed since the last call through it.
 
-    The instances are module-level, so every tool call in every thread shares one clock
-    per service. This is not politeness: exceeding one request a second gets JARVIS
-    banned from Nominatim.
+    The instances are module-level, so every thread shares one clock per service: this
+    is not politeness, exceeding a request a second gets JARVIS banned from Nominatim.
     """
 
     def __init__(self, min_interval: float, name: str = "") -> None:
@@ -198,18 +194,20 @@ def _regex_e164(text: str, region: str) -> str:
         body = re.sub(r"\D", "", compact[1:])
         return f"+{body}" if 8 <= len(body) <= 15 else ""
     body = re.sub(r"\D", "", compact)
-    if body.startswith("0"):  # national trunk prefix
-        body = body[1:]
+    if not body.startswith("0"):
+        # Without a country code or a national trunk prefix this is not a phone
+        # number - it is an organisation number, a date or a price. Never guess.
+        return ""
     code = COUNTRY_CODES.get((region or "SE").upper(), "")
+    body = body[1:]
     return f"+{code}{body}" if code and 6 <= len(body) <= 12 else ""
 
 
 def normalise_phone(raw: Any, region: str = "SE") -> tuple[str, str]:
     """Normalise ``raw`` to E.164, returning ``(number, method)``.
 
-    ``method`` is ``"phonenumbers"``, ``"regex"`` or ``""``. An empty number means the
-    input was not a usable telephone number, and the caller must report that nothing
-    was found rather than speak the raw text back.
+    ``method`` is ``"phonenumbers"``, ``"regex"`` or ``""``; an empty number means the
+    caller must report that nothing was found rather than speak the raw text back.
     """
     text = _clean(raw)
     if not text:
@@ -298,9 +296,8 @@ def _float(value: Any) -> float | None:
 class PlaceCache:
     """``places.json``: a tolerant store, so a barber is looked up once, ever.
 
-    Loading never raises - a truncated or hand-edited file degrades to an empty cache
-    and a warning. Saving is atomic (temp file in the same directory plus
-    ``os.replace``), exactly as :mod:`jarvis.core.memory` does it.
+    Loading never raises; saving is atomic (temp file plus ``os.replace``), exactly as
+    :mod:`jarvis.core.memory` does it.
     """
 
     def __init__(self, path: str | Path = CACHE_FILENAME) -> None:
@@ -472,6 +469,12 @@ def _get_text(url: str) -> str:
         return ""
 
 
+def _blocked(url: str) -> bool:
+    """True for the directories whose terms of use forbid scraping them."""
+    host = _clean(url).casefold()
+    return any(f"{blocked}" in host for blocked in BLOCKED_HOSTS)
+
+
 def _phone_from_text(text: str, region: str) -> str:
     """The first genuine-looking phone number in a page or a snippet."""
     for candidate in _TEL_HREF_RE.findall(text):
@@ -505,7 +508,7 @@ def _web_rows(query: str) -> list[dict[str, str]]:
 def _phone_from_web(name: str, near: str, website: str, region: str,
                     trail: list[str]) -> tuple[str, str]:
     """Last resort: the business's own site, then the search results themselves."""
-    if website:
+    if website and not _blocked(website):
         number = _phone_from_text(_get_text(website), region)
         trail.append(f"website {website}: {'phone found' if number else 'no phone'}")
         if number:
@@ -515,10 +518,13 @@ def _phone_from_web(name: str, near: str, website: str, region: str,
     trail.append(f"web search {query!r}: {len(rows)} result(s)")
     fetched = 0
     for row in rows:
+        url = _clean(row.get("url"))
+        if _blocked(url):
+            _log.debug("Skipping %s: its terms forbid reading numbers from it.", url)
+            continue
         number = _phone_from_text(f"{row.get('title', '')} {row.get('body', '')}", region)
         if number:
-            return number, _clean(f"web snippet {row.get('url', '')}")
-        url = _clean(row.get("url"))
+            return number, _clean(f"web snippet {url}")
         if url and fetched < MAX_PAGE_FETCHES:
             fetched += 1
             number = _phone_from_text(_get_text(url), region)

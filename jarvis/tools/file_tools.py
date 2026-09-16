@@ -1,6 +1,11 @@
 """File tools: finding a file by name, and moving, renaming or trashing it.
 
-``find_file`` is a bounded search over the user's Desktop, Documents and Downloads.
+``find_file`` is a bounded search over the user's Desktop, Documents and Downloads,
+with two extras: ``contains`` asks the Windows Search index what is *inside* files
+(it has already parsed the PDFs and .docx), and ``modified_since`` narrows the answer
+to what changed recently. The index is reached through ``win32com``, imported inside
+the function, and the plain walk remains the fallback whenever it is not there.
+
 ``file_ops`` is the guarded one that touches the disk, and it is checked twice: the
 dispatcher confirms out loud because the tool is GUARDED, and this module re-validates
 the resolved path itself, so a direct call can never reach ``C:\\Windows``, a drive
@@ -18,7 +23,7 @@ import re
 import shutil
 from collections import deque
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -29,6 +34,7 @@ from jarvis.tools.registry import tool
 __all__ = [
     "find_file", "file_ops", "FileHit", "FILE_ACTIONS", "MAX_DEPTH", "MAX_ENTRIES",
     "MAX_RESULTS", "MAX_WILDCARD_MATCHES", "DIRECTORY_CONFIRM_FILES", "TRASH_FOLDER_NAME",
+    "INDEX_RESULTS", "INDEX_CONNECTION_STRING", "INDEX_FIELDS", "NOTHING_INDEXED",
 ]
 
 _log = get_logger("tools.files")
@@ -39,6 +45,7 @@ MAX_RESULTS = 5                  #: hits reported back to the model
 MAX_WILDCARD_MATCHES = 20        #: a wildcard matching more files than this is refused
 DIRECTORY_CONFIRM_FILES = 50     #: a bigger folder needs a second, explicit confirmation
 TRASH_FOLDER_NAME = "Jarvis Trash"          #: used instead of deleting anything
+INDEX_RESULTS = 10               #: rows asked of the Windows Search index
 FILE_ACTIONS = ("move", "delete", "rename")  #: accepted values of ``action``
 
 #: Directory names never walked: caches, repositories and machine-managed folders.
@@ -228,46 +235,240 @@ def _where(path: Path) -> str:
     return f"your {parent.name} folder" if parent.name else str(parent)
 
 
+# ======================================================================================
+# Searching inside files: the index Windows already maintains
+# ======================================================================================
+#: ADODB connection string for the Windows Search provider.
+INDEX_CONNECTION_STRING = (
+    'Provider=Search.CollatorDSO;Extended Properties="Application=Windows"'
+)
+#: Columns asked of SYSTEMINDEX, in the order they are read back.
+INDEX_FIELDS = ("System.ItemPathDisplay", "System.DateModified", "System.Size")
+#: Said when the index cannot answer - never "that file does not exist".
+NOTHING_INDEXED = "Nothing indexed matches that, sir."
+
+_SINCE_MIDNIGHTS = {"today": 0, "idag": 0, "i dag": 0, "yesterday": 1, "igår": 1,
+                    "i gar": 1, "this week": 7, "last week": 7, "den här veckan": 7,
+                    "this month": 30, "last month": 30, "this year": 365}
+_SINCE_UNITS = {"minute": 60, "min": 60, "hour": 3600, "hr": 3600, "day": 86400,
+                "week": 604800, "month": 2592000, "year": 31536000}
+_SINCE_RE = re.compile(r"(\d+)\s*(minute|min|hour|hr|day|week|month|year)s?")
+#: Characters that would break out of a SQL literal or a CONTAINS phrase.
+_SQL_UNSAFE_RE = re.compile(r"[\"'`%\x00-\x1f]")
+
+
+def _parse_since(raw: str) -> tuple[float | None, bool]:
+    """Turn "today", "last week", "3 days" or an ISO date into an epoch cutoff.
+
+    Returns ``(cutoff, understood)``. An empty value is understood and means "no
+    filter"; something unparseable is reported rather than silently ignored, because
+    quietly dropping the constraint would make the answer a lie.
+    """
+    text = " ".join(str(raw or "").strip().lower().split())
+    for prefix in ("since ", "in the last ", "within the last ", "the last ", "past "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    if not text:
+        return None, True
+    now = datetime.now()
+    if text in _SINCE_MIDNIGHTS:
+        midnight = datetime(now.year, now.month, now.day)
+        return (midnight - timedelta(days=_SINCE_MIDNIGHTS[text])).timestamp(), True
+    match = _SINCE_RE.search(text)
+    if match:
+        seconds = int(match.group(1)) * _SINCE_UNITS[match.group(2)]
+        return (now - timedelta(seconds=seconds)).timestamp(), True
+    try:
+        return datetime.fromisoformat(text).timestamp(), True
+    except ValueError:
+        _log.info("Could not understand modified_since %r", raw)
+        return None, False
+
+
+def _sql_literal(value: str) -> str:
+    """Strip everything that could end a SQL literal; the index takes words, not code."""
+    return _SQL_UNSAFE_RE.sub(" ", str(value)).strip()
+
+
+def _index_sql(contains: str, roots: Iterable[Path], cutoff: float | None,
+               name: str = "") -> str:
+    """The SYSTEMINDEX query: what to look for, where, and how recent."""
+    scopes = " OR ".join(
+        f"SCOPE='file:{_sql_literal(str(root)).replace(chr(92), '/')}'" for root in roots
+    )
+    clauses = [f"CONTAINS('\"{_sql_literal(contains)}\"')"]
+    if scopes:
+        clauses.append(f"({scopes})")
+    if cutoff:
+        stamp = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
+        clauses.append(f"System.DateModified > '{stamp}'")
+    if name and not _WILDCARD_RE.search(name):
+        clauses.append(f"System.FileName LIKE '%{_sql_literal(name)}%'")
+    return (f"SELECT TOP {INDEX_RESULTS} {', '.join(INDEX_FIELDS)} FROM SYSTEMINDEX "
+            f"WHERE {' AND '.join(clauses)} ORDER BY System.DateModified DESC")
+
+
+def _field(record: object, name: str) -> object:
+    """One column of the current row, or ``None`` when the provider omits it."""
+    try:
+        return record.Fields.Item(name).Value  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - a missing column must not lose the whole row
+        return None
+
+
+def _as_mtime(value: object) -> float:
+    """A row's DateModified as an epoch float, whatever pywin32 handed back."""
+    timestamp = getattr(value, "timestamp", None)
+    if callable(timestamp):
+        try:
+            return float(timestamp())
+        except Exception:  # noqa: BLE001 - some COM date types raise on conversion
+            return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("/", "-")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _index_search(contains: str, roots: list[Path], cutoff: float | None,
+                  name: str = "") -> list[FileHit] | None:
+    """Ask the Windows Search index what is inside the user's files.
+
+    Returns the hits, or ``None`` when the index could not be reached at all - a
+    missing pywin32, a service that is stopped, a catalogue that is still rebuilding.
+    ``None`` is not "no matches": the caller falls back to the walk and says so.
+    """
+    try:
+        import win32com.client  # noqa: PLC0415 - Windows-only, imported on demand
+    except Exception as exc:  # noqa: BLE001 - ImportError on Linux, DLL errors elsewhere
+        _log.info("Windows Search index unavailable (no win32com): %s", exc)
+        return None
+    sql = _index_sql(contains, roots, cutoff, name)
+    connection = None
+    try:
+        connection = win32com.client.Dispatch("ADODB.Connection")
+        connection.Open(INDEX_CONNECTION_STRING)
+        answer = connection.Execute(sql)
+        record = answer[0] if isinstance(answer, (tuple, list)) else answer
+        hits: list[FileHit] = []
+        while not record.EOF and len(hits) < INDEX_RESULTS:
+            raw_path = _field(record, INDEX_FIELDS[0])
+            if raw_path:
+                size = _field(record, INDEX_FIELDS[2])
+                hits.append(FileHit(Path(str(raw_path)),
+                                    int(size) if isinstance(size, (int, float)) else 0,
+                                    _as_mtime(_field(record, INDEX_FIELDS[1]))))
+            record.MoveNext()
+        _log.debug("Index query returned %d row(s) for %r", len(hits), contains)
+        return hits
+    except Exception as exc:  # noqa: BLE001 - COM raises everything under the sun
+        _log.info("Windows Search index could not answer: %s", exc)
+        return None
+    finally:
+        try:
+            if connection is not None:
+                connection.Close()
+        except Exception:  # noqa: BLE001 - a failed close is not the user's problem
+            _log.debug("Closing the index connection failed", exc_info=True)
+
+
 @tool(
     "find_file",
     description=(
-        "Find a file by name or part of a name in the user's Desktop, Documents and "
-        "Downloads folders. Wildcards such as '*.pdf' are supported."
+        "Find a file in the user's Desktop, Documents and Downloads folders. Search by "
+        "name (wildcards such as '*.pdf' work), by the text inside the file - which also "
+        "looks inside PDFs and Word documents through the Windows Search index - or by "
+        "when it was last changed."
     ),
     parameters={
         "type": "object",
-        "required": ["name"],
-        "properties": {"name": {"type": "string", "description":
-                                "The file name, part of it, or a glob such as '*.pdf'."}},
+        "properties": {
+            "name": {"type": "string", "description":
+                     "The file name, part of it, or a glob such as '*.pdf'."},
+            "contains": {"type": "string", "description":
+                         "Words that appear inside the file, for example an invoice "
+                         "number or a name mentioned in a PDF."},
+            "modified_since": {"type": "string", "description":
+                               "Only files changed since then: 'today', 'yesterday', "
+                               "'last week', '3 days' or a date like '2026-04-01'."},
+        },
     },
     tier=Tier.SAFE,
 )
 def find_file(ctx: ToolContext, args: dict) -> ToolResult:
-    """Search the configured folders and report the five newest matches."""
+    """Find files by name, by what is inside them, or by when they last changed.
+
+    ``contains`` goes to the Windows Search index, which has already parsed the PDFs
+    and .docx files. When that index is missing, stopped or rebuilding the plain walk
+    answers instead, and the summary says so - a content search that could not run is
+    never reported as a file that does not exist.
+    """
     needle = str(args.get("name") or "").strip().strip('"').strip("'")
-    if not needle:
-        return ToolResult.fail("I need a file name to look for, sir.")
+    contains = str(args.get("contains") or "").strip().strip('"').strip("'")
+    raw_since = str(args.get("modified_since") or "").strip()
+    if not needle and not contains:
+        return ToolResult.fail("I need a file name or some text to look for, sir.")
+    cutoff, understood = _parse_since(raw_since)
+    if not understood:
+        return ToolResult.fail(
+            f"I couldn't work out what time you meant by {raw_since}, sir.",
+            detail=f"Unparseable modified_since {raw_since!r}.")
     roots = _search_roots(ctx)
     if not roots:
         return ToolResult.fail("I have no folders to search, sir.",
                                detail=f"No search directory exists under {_user_profile()}.")
-    hits, visited, truncated = _search(needle, roots)
+
+    indexed = _index_search(contains, roots, cutoff, needle) if contains else None
+    notes: list[str] = []
+    if indexed is not None:
+        hits, source, truncated, visited = indexed, "index", False, 0
+    else:
+        if contains:
+            notes.append("The Windows Search index was not available, so I could only "
+                         "match file names.")
+        # Falling back on the file name: a document about an invoice is very
+        # often named after it. Never '*', which would match the whole tree.
+        hits, visited, truncated = _search(needle or contains, roots)
+        source = "walk"
+    if cutoff is not None:
+        hits = [hit for hit in hits if hit.mtime >= cutoff]
+
     ranked = _newest_first(hits)[:MAX_RESULTS]
-    detail = _describe(ranked) or f"No match for {needle!r} in: " + ", ".join(map(str, roots))
+    query = contains or needle
+    detail = _describe(ranked) or f"No match for {query!r} in: " + ", ".join(map(str, roots))
     if truncated:
         detail = f"{detail}\n(Search stopped after {visited} entries.)"
-    data = {"query": needle, "count": len(hits), "paths": [str(hit.path) for hit in ranked]}
+    if notes:
+        detail = f"{detail}\n" + "\n".join(notes)
+    data = {"query": needle, "contains": contains, "modified_since": raw_since or None,
+            "source": source, "count": len(hits),
+            "paths": [str(hit.path) for hit in ranked]}
+
     if not ranked:
+        if contains and source == "walk":
+            return ToolResult(True, NOTHING_INDEXED, detail, data)
+        if contains:
+            return ToolResult(True, f"Nothing I have indexed contains {contains}, sir.",
+                              detail, data)
         return ToolResult(True, f"I found nothing matching {needle}, sir.", detail, data)
+
     best, others = ranked[0], len(hits) - 1
     place = _where(best.path)
-    if others <= 0:
-        summary = f"Found {best.name} in {place}, sir, and nothing else like it."
-    elif others == 1:
-        summary = f"Found {best.name} in {place}, sir, and one other match."
+    if contains and source == "index":
+        opening = f"Found {best.name} in {place}, sir, with {contains} inside"
+    elif contains:
+        opening = (f"I couldn't search inside your files, sir, but {best.name} in "
+                   f"{place} matches by name")
     else:
-        summary = (f"Found {best.name} in {place}, sir, along with "
-                   f"{_spoken_count(others)} other matches.")
+        opening = f"Found {best.name} in {place}, sir"
+    if others <= 0:
+        summary = f"{opening}, and nothing else like it."
+    elif others == 1:
+        summary = f"{opening}, along with one other match."
+    else:
+        summary = f"{opening}, along with {_spoken_count(others)} other matches."
     return ToolResult(True, summary, detail, data)
 
 

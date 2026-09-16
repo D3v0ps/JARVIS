@@ -138,6 +138,98 @@ for _source, _reason in BLOCKLIST_PATTERNS:
         _log.error("Invalid blocklist pattern %r (%s); it will not be enforced", _source, exc)
 
 
+#: Emergency numbers, which JARVIS must never dial on his own.
+#:
+#: A misheard word should not be able to summon an ambulance. Sweden, like most
+#: countries, treats a false emergency call as an offence, and the cost of a wrong
+#: dial is someone else's emergency going unanswered. The refusal is deliberately
+#: helpful rather than obstructive: it tells the user to dial it themselves, because
+#: the one thing worse than an accidental call is a real emergency that JARVIS got in
+#: the way of.
+EMERGENCY_NUMBERS: frozenset[str] = frozenset(
+    {
+        "112",            # EU, including Sweden
+        "911",            # North America
+        "999",            # UK, Ireland
+        "000",            # Australia
+        "110",            # police in Japan, China, Norway
+        "118",            # medical in Italy, fire in Japan
+        "119",            # fire/ambulance across much of Asia
+    }
+)
+
+#: Swedish non-emergency services that should also never be auto-dialled.
+SENSITIVE_NUMBERS: frozenset[str] = frozenset({"11313", "11414", "1177", "90000"})
+
+
+def normalise_number(value: str) -> str:
+    """Strip everything a person might say or type around a phone number."""
+    return "".join(character for character in str(value or "") if character.isdigit())
+
+
+def is_emergency_number(value: str) -> str | None:
+    """Return the reason when this number must never be dialled automatically."""
+    digits = normalise_number(value)
+    if not digits:
+        return None
+    # A number written +46 112 or 0046112 still ends in the emergency digits.
+    for prefix in ("0046", "46", "00"):
+        if digits.startswith(prefix) and len(digits) > len(prefix):
+            trimmed = digits[len(prefix):]
+            if trimmed in EMERGENCY_NUMBERS:
+                return "dialling an emergency number"
+    if digits in EMERGENCY_NUMBERS:
+        return "dialling an emergency number"
+    if digits in SENSITIVE_NUMBERS:
+        return "dialling an emergency or healthcare line"
+    return None
+
+
+#: Tools whose arguments carry a phone number, checked before anything else happens.
+_DIALLING_TOOLS: frozenset[str] = frozenset({"dial_number", "call", "place_call"})
+
+
+#: The in-character refusal, and the few cases that deserve a more useful one.
+DEFAULT_REFUSAL = "I'm afraid that's beyond what I'm willing to do, sir."
+
+_REFUSAL_SENTENCES: dict[str, str] = {
+    "dialling an emergency number": (
+        "I won't dial the emergency services, sir. "
+        "If this is a real emergency, please call them yourself."
+    ),
+    "dialling an emergency or healthcare line": (
+        "I'd rather you called that line yourself, sir."
+    ),
+}
+
+
+def refusal_for(reason: str) -> str:
+    """The sentence JARVIS says when he refuses.
+
+    Almost everything gets the standard line, which says nothing about why - a
+    blocklist that explains itself is a blocklist that teaches you around it. The
+    exception is anything to do with emergency services: "that's beyond what I'm
+    willing to do" is a useless thing to hear when someone needs an ambulance, so
+    those refusals point the user at the phone instead.
+    """
+    return _REFUSAL_SENTENCES.get(str(reason or "").strip(), DEFAULT_REFUSAL)
+
+
+def check_tool_arguments(name: str, args: dict) -> str | None:
+    """Refusals that depend on which tool is being called, not just on the text.
+
+    Runs in the dispatcher BEFORE the tier check, so a guarded tool is refused
+    outright rather than confirmed and then refused - asking "shall I call 112?" and
+    only objecting after the user says yes is the wrong way round.
+    """
+    if str(name) in _DIALLING_TOOLS:
+        for key in ("number", "to", "phone"):
+            reason = is_emergency_number(str((args or {}).get(key, "")))
+            if reason:
+                return reason
+    return None
+
+
 def check_blocked(text: str) -> str | None:
     """Return the reason for the first blocklist match, or ``None`` when clean."""
     if not text:

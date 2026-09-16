@@ -354,3 +354,69 @@ def test_every_contract_cancel_word_cancels(word):
 
 def test_a_folder_merely_starting_with_windows_is_not_the_windows_directory():
     assert check_blocked(r"Remove-Item D:\windows-backup\old.zip") is None
+
+
+# --------------------------------------------------------------------------------------
+# Emergency numbers
+# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "number",
+    ["112", "911", "999", "000", "110", "118", "119",
+     "+46112", "0046112", "00112", "1 1 2", "(112)", "1-1-2",
+     "11313", "1177", "90000"],
+)
+def test_an_emergency_number_is_never_dialled_automatically(number):
+    """A misheard word must not be able to summon an ambulance."""
+    from jarvis.tools.safety import is_emergency_number
+
+    assert is_emergency_number(number) is not None, number
+
+
+@pytest.mark.parametrize(
+    "number",
+    ["+46812345678", "08-123 45 67", "0701234567", "112233", "+46112233445",
+     "+4681234567", "020123456", "+1 202 555 0147"],
+)
+def test_an_ordinary_number_is_not_mistaken_for_an_emergency(number):
+    """08 is Stockholm's area code. Over-blocking here means he cannot call anyone."""
+    from jarvis.tools.safety import is_emergency_number
+
+    assert is_emergency_number(number) is None, number
+
+
+def test_an_empty_number_is_not_an_emergency():
+    from jarvis.tools.safety import is_emergency_number
+
+    assert is_emergency_number("") is None
+    assert is_emergency_number("   ") is None
+
+
+def test_the_refusal_tells_the_user_to_call_them_himself():
+    """Refusing must never stand between a person and help."""
+    import logging
+
+    from jarvis.core.scheduler import Scheduler
+    from jarvis.core.state import StateBus
+    from jarvis.tools import registry
+    from jarvis.tools.base import ToolContext
+    from jarvis.tools.dispatcher import Dispatcher
+
+    registry.load_all()
+    asked: list[str] = []
+    ctx = ToolContext(
+        config=__import__("jarvis.config", fromlist=["Config"]).Config.load("config.yaml"),
+        memory=__import__("jarvis.core.memory", fromlist=["Memory"]).Memory("/tmp/emergency.json"),
+        logger=logging.getLogger("test"),
+        speak=lambda s: None,
+        confirm=lambda s: asked.append(s) or True,
+        notify=lambda s: None,
+        scheduler=Scheduler(on_due=lambda job: None),
+        state=StateBus(),
+    )
+
+    result = Dispatcher(ctx).execute("dial_number", {"number": "112"})
+
+    assert result.ok is False
+    assert result.refused is True
+    assert "yourself" in result.summary.lower()
+    assert not asked, "it must refuse outright, not ask whether to dial 112"

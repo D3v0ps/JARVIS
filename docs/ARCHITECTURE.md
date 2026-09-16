@@ -669,7 +669,7 @@ Wired in `core/assistant.py::_handle_utterance`, between transcription and
 inside a tool round. A GUARDED tool matched by a reflex still goes through
 `Dispatcher.execute`, so it still asks. Config: `assistant.reflex: true`.
 
-## 19. `jarvis/tools/places.py` — finding a real business's number
+## 19. `jarvis/tools/places_tools.py` — finding a real business's number
 
 ```python
 @tool("find_business", tier=SAFE)   # name, near?
@@ -689,7 +689,7 @@ Numbers are normalised to E.164 with `phonenumbers` (offline), region from
 `tools.home_region` (default `SE`). Results cache to `places.json` beside `memory.json`
 so a barber is looked up once, ever.
 
-## 20. `jarvis/tools/telephony.py` — dialling, honestly
+## 20. `jarvis/tools/telephony_tools.py` — dialling, honestly
 
 ```python
 @tool("dial_number", tier=GUARDED)   # number, who?

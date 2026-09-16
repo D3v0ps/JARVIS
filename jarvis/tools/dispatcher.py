@@ -19,7 +19,12 @@ from typing import Any, Iterable, Sequence
 from jarvis.core.logging import get_logger, log_refusal, log_tool_call
 from jarvis.tools import registry
 from jarvis.tools.base import Tier, ToolContext, ToolResult, ToolSpec
-from jarvis.tools.safety import check_blocked, effective_tier
+from jarvis.tools.safety import (
+    check_blocked,
+    check_tool_arguments,
+    effective_tier,
+    refusal_for,
+)
 
 __all__ = ["Dispatcher", "REFUSAL_SUMMARY", "CANCELLED_SUMMARY"]
 
@@ -139,7 +144,10 @@ class Dispatcher:
         if reason is not None:
             detail = f"Blocked tool call {spec.name}({self._loggable(coerced)!r}): {reason}."
             log_refusal(reason, detail)
-            result = ToolResult.refuse(REFUSAL_SUMMARY, detail=detail)
+            # Most refusals say nothing about why - a blocklist that explains itself
+            # teaches you around it. Emergency numbers are the exception: "beyond
+            # what I'm willing to do" is a useless thing to hear in an emergency.
+            result = ToolResult.refuse(refusal_for(reason), detail=detail)
             self._log(spec.name, coerced, result, started)
             return result
 
@@ -253,7 +261,20 @@ class Dispatcher:
 
     # -- blocklist -------------------------------------------------------------------------
     def _blocked_reason(self, name: str, args: dict) -> str | None:
-        """Run the blocklist over the tool name and every string in its arguments."""
+        """Run the blocklist over the tool name and every string in its arguments.
+
+        Argument-level refusals come first. A guarded tool must be refused outright
+        rather than confirmed and then refused: asking "shall I call 112, sir?" and
+        only objecting after the user says yes is exactly the wrong way round.
+        """
+        try:
+            reason = check_tool_arguments(name, args)
+            if reason:
+                return reason
+        except Exception:  # noqa: BLE001 - a broken check must not open the gate
+            self.logger.error("Argument safety check failed for %s", name, exc_info=True)
+            return "an argument that could not be safety-checked"
+
         candidates: list[str] = [name] if name else []
         self._collect_strings(args, candidates, 0)
         for text in candidates:

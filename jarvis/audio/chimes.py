@@ -6,6 +6,13 @@ rising tones (A5 then E6) that overlap enough to read as a single gesture, with 
 attack, a short decay tail and a gentle second harmonic for warmth. The sleep chime is
 its descending mirror.
 
+The three earcons — :func:`ack`, :func:`done` and :func:`awaiting` — share that same
+A5/E6 motif so the whole set sounds like one instrument. They are deliberately
+*binary*: something succeeded, something was refused, something is waiting. Which tool
+ran is never encoded in a tone, because abstract earcons are a measurably terrible way
+to tell things apart and the operator would have to learn a vocabulary he never asked
+for.
+
 All generators return ``float32`` mono in ``[-1, 1]``, peak-normalised to about
 :data:`PEAK` (0.6) so the caller still has headroom for its own volume scaling, and
 every sound starts and ends at exactly zero so nothing clicks.
@@ -33,6 +40,7 @@ A5 = 880.00
 E6 = 1318.51
 C6 = 1046.50
 E5 = 659.25
+A4 = 440.00
 BUZZ = 165.00
 
 # Amplitude of the second harmonic mixed into the melodic chimes. Small enough to stay
@@ -41,6 +49,14 @@ _HARMONIC = 0.22
 
 # Global fade applied to a finished chime so the very first and last sample are zero.
 _EDGE_FADE_MS = 2.0
+
+#: :func:`awaiting` repeats for as long as a guarded confirmation is pending, so it is
+#: mixed quieter than the one-shot chimes. At full :data:`PEAK` the repetition wears.
+AWAITING_PEAK = PEAK * 0.75
+
+#: Suggested gap between repeats of :func:`awaiting`, in milliseconds. Five repeats then
+#: cover the ten-second confirmation window without ever overlapping themselves.
+AWAITING_PERIOD_MS = 2000.0
 
 
 def _samples(ms: float, sample_rate: int) -> int:
@@ -183,10 +199,12 @@ def _normalize(audio: np.ndarray, peak: float = PEAK) -> np.ndarray:
     return (out * (float(peak) / current)).astype(np.float32)
 
 
-def _finish(parts: list[tuple[float, np.ndarray]], sample_rate: int) -> np.ndarray:
-    """Mix, normalise to :data:`PEAK`, fade the edges and clamp to [-1, 1]."""
+def _finish(
+    parts: list[tuple[float, np.ndarray]], sample_rate: int, *, peak: float = PEAK
+) -> np.ndarray:
+    """Mix, normalise to ``peak``, fade the edges and clamp to [-1, 1]."""
     mixed = _mix(parts, sample_rate)
-    mixed = _normalize(mixed, PEAK)
+    mixed = _normalize(mixed, peak)
     mixed = _edge_fades(mixed, _EDGE_FADE_MS, sample_rate)
     return np.clip(mixed, -1.0, 1.0).astype(np.float32)
 
@@ -230,6 +248,58 @@ def error_chime(sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
     rough_b = _voice(BUZZ * 3.0, 110.0, sample_rate, volume=0.15, attack_ms=5.0, harmonic=0.0)
     parts = [(0.0, buzz_a), (0.0, rough_a), (150.0, buzz_b), (150.0, rough_b)]
     return _finish(parts, sample_rate)
+
+
+# --- the earcon family ---------------------------------------------------------------
+# Brief mode plays one of these instead of speaking a result, which takes a whole model
+# round trip out of the latency budget. Three sounds only, and all three are built from
+# the wake chime's notes so they are heard as the same voice rather than as three
+# unrelated beeps.
+
+
+def ack(sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
+    """A single short blip (~70 ms at E6): heard you, working on it.
+
+    This is the top note of the wake chime on its own — the shortest possible member of
+    the family, and the one that has to be inaudible as an interruption.
+    """
+    parts = [
+        (0.0, _voice(E6, 70.0, sample_rate, volume=1.0, attack_ms=5.0, harmonic=0.16, tail=0.05)),
+    ]
+    return _finish(parts, sample_rate)
+
+
+def done(sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
+    """The success earcon: ~220 ms, A5 stepping up to E6.
+
+    The same rising fifth as :func:`wake_chime`, but the two notes are played in
+    sequence with a real gap instead of overlapping, so it reads as a full stop rather
+    than as an opening. Rising means it worked; nothing else in the set rises.
+    """
+    parts = [
+        (0.0, _voice(A5, 100.0, sample_rate, volume=0.88, attack_ms=8.0, tail=0.07)),
+        (110.0, _voice(E6, 110.0, sample_rate, volume=1.00, attack_ms=8.0, tail=0.06)),
+    ]
+    return _finish(parts, sample_rate)
+
+
+def awaiting(sample_rate: int = DEFAULT_SAMPLE_RATE) -> np.ndarray:
+    """The waiting earcon: ~400 ms, E5 falling gently to A4, meant to be repeated.
+
+    Same fifth as the rest of the family, an octave down and slowed right out — low and
+    unhurried is what makes it read amber rather than green or red. It is played on a
+    loop of :data:`AWAITING_PERIOD_MS` while a guarded action waits for its spoken
+    confirmation, so the operator can *hear* the ten-second window running as well as
+    watch the ring, and it is normalised to the quieter :data:`AWAITING_PEAK` because a
+    sound that repeats five times must not be as loud as one that plays once.
+    """
+    parts = [
+        (0.0, _voice(E5, 170.0, sample_rate, volume=0.92, attack_ms=22.0,
+                     release_ms=14.0, tail=0.16)),
+        (200.0, _voice(A4, 200.0, sample_rate, volume=1.00, attack_ms=26.0,
+                       release_ms=18.0, tail=0.12)),
+    ]
+    return _finish(parts, sample_rate, peak=AWAITING_PEAK)
 
 
 def apply_volume(audio: np.ndarray, volume: float) -> np.ndarray:
