@@ -30,8 +30,11 @@ echo "  linking Install-JARVIS.exe..."
 "$CC" -municode -O2 -s -Wall -Wextra \
       -o "$ROOT/Install-JARVIS.exe" install_jarvis.c install_res.o -lshell32 -luser32
 
-echo "  linking JARVIS.exe..."
-"$CC" -municode -O2 -s -Wall -Wextra \
+# -mwindows on this one only: JARVIS.exe is a GUI-subsystem program so that
+# double-clicking it never flashes a console. Install-JARVIS.exe keeps its
+# console on purpose - the install is a half-hour of output worth watching.
+echo "  linking JARVIS.exe (GUI subsystem)..."
+"$CC" -municode -mwindows -O2 -s -Wall -Wextra \
       -o "$ROOT/JARVIS.exe" jarvis_launcher.c jarvis_res.o -lshell32 -luser32
 
 rm -f install_res.o jarvis_res.o

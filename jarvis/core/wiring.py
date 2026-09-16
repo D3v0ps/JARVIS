@@ -23,7 +23,7 @@ from jarvis.core.memory import Memory
 from jarvis.core.scheduler import Scheduler
 from jarvis.core.state import StateBus
 
-__all__ = ["Components", "build", "build_face"]
+__all__ = ["Components", "build", "build_desk", "build_face"]
 
 
 @dataclass
@@ -264,6 +264,7 @@ def build_face(
     *,
     on_quit: Callable[[], None],
     on_toggle_pause: Callable[[], None],
+    on_show_window: Callable[[], None] | None = None,
     logger: logging.Logger,
 ) -> tuple[Any, Any]:
     """Return ``(overlay, tray)``, either of which may be None.
@@ -301,13 +302,62 @@ def build_face(
         try:
             from jarvis.ui.tray import Tray
 
-            tray = Tray(state, on_quit=on_quit, on_toggle_pause=on_toggle_pause, logger=logger)
+            tray = Tray(
+                state,
+                on_quit=on_quit,
+                on_toggle_pause=on_toggle_pause,
+                on_show_window=on_show_window,
+                logger=logger,
+            )
             tray.start()
         except Exception as exc:  # noqa: BLE001
             logger.info("No tray icon this session: %s", exc)
             tray = None
 
     return overlay, tray
+
+
+def build_desk(
+    cfg: Config, assistant: Any, logger: logging.Logger
+) -> tuple[Any, Any]:
+    """Return ``(server, window)``, either of which may be None.
+
+    In the spirit of :func:`build_face`, and for the same reason: the desk's window is
+    the nicest face JARVIS has and the least essential thing he owns. Flask may not be
+    installed, the port may be taken, WebView2 may be missing - each of those ends in
+    ``None`` and a line in the log, and the assistant carries on with the ring, or
+    with nothing at all.
+
+    The window is built even when it is not opened at start, because the ticket in the
+    server's URL is minted once and expires; the tray's ``Open the console`` opens the
+    window that was made here rather than inventing a second door.
+    """
+    if not cfg.get("ui.window", True):
+        return None, None
+
+    server = None
+    try:
+        from jarvis.desk import DeskServer
+
+        candidate = DeskServer(cfg, assistant, get_logger("desk"))
+        server = candidate if candidate.start() else None
+    except Exception as exc:  # noqa: BLE001 - ImportError included: the desk is optional
+        logger.info("No desk window this session: %s", exc)
+        server = None
+    if server is None:
+        return None, None
+
+    window = None
+    try:
+        from jarvis.desk import DeskWindow
+
+        window = DeskWindow(cfg, server.url, logger=get_logger("desk.window"))
+        if cfg.get("ui.open_window_on_start", True) and not window.start():
+            logger.info("The desk window is served, but nothing here would host it.")
+    except Exception as exc:  # noqa: BLE001
+        logger.info("The desk window could not be opened: %s", exc)
+        window = None
+    return server, window
 
 
 # --- choosing a model that is actually there -------------------------------------------

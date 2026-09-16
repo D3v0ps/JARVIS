@@ -1,0 +1,1356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>JARVIS</title>
+<!--
+  The desk window: one file, no build step, no network.
+
+  The phone's page may reach a CDN for its speech detection because a phone has no
+  ears of its own. The desk has real ears, real telemetry and a real voice, so this
+  page needs nothing from outside the loopback socket it was served from - and that
+  is worth enforcing rather than merely intending. Everything here is inline, the
+  Content-Security-Policy above forbids anything else, and the window therefore
+  renders identically on a machine with the network unplugged.
+
+  It is deliberately the same product as the phone: the same palette, the same arc
+  reactor down to the coil geometry, the same card vocabulary. What differs is what
+  a 980x720 desktop window can hold that a 390px phone cannot - the instruments
+  down the right-hand side, the working line that shows a turn assembling itself,
+  and a confirmation bar wide enough to read a GUARDED announcement in full.
+
+  The page is a spectator with ten verbs. It never decides anything: it draws what
+  the bus tells it and sends one of the frames in the contract back. A frame it
+  does not understand is ignored, a socket that dies is reconnected, and neither
+  costs the assistant anything at all.
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:;
+               style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';
+               font-src 'self'; base-uri 'none'; form-action 'none'">
+<style>
+  /* The phone's palette, unchanged: idle blue, listening cyan, thinking amber,
+     speaking teal, on near-black. One product, two windows. */
+  :root {
+    --bg: #05080c;
+    --panel: rgba(18, 30, 40, 0.62);
+    --panel-2: rgba(12, 22, 30, 0.85);
+    --edge: rgba(41, 182, 246, 0.22);
+    --ink: #d8ecf7;
+    --dim: #6f8494;
+    --idle: #1b6fa8;
+    --listening: #29b6f6;
+    --thinking: #ffb300;
+    --speaking: #3ee0c8;
+    --paused: #5c6670;
+    --bad: #ff6f60;
+    --accent: var(--idle);
+    --ring: 196px;
+    --mono: "Cascadia Mono", Consolas, ui-monospace, SFMono-Regular, monospace;
+    --bar: 36px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 14.5px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+    user-select: none; -webkit-user-select: none;
+    cursor: default;
+  }
+  /* The room's light follows his state. A tinted layer rather than a tinted
+     gradient, because a colour token cannot carry an alpha of its own. */
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background: radial-gradient(90% 55% at 32% -8%, var(--accent), transparent 68%);
+    opacity: 0.13; transition: opacity .6s ease;
+  }
+  body[data-state="thinking"]::before,
+  body[data-state="listening"]::before { opacity: 0.2; }
+  body[data-state="paused"]::before { opacity: 0.05; }
+  input, textarea { user-select: text; -webkit-user-select: text; }
+  button { font: inherit; color: inherit; cursor: pointer; background: none; border: 0; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: rgba(41,182,246,0.16); border-radius: 9px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(41,182,246,0.3); }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* --- our own title bar --------------------------------------------------- */
+  #bar {
+    flex: 0 0 var(--bar); height: var(--bar); z-index: 3;
+    display: flex; align-items: stretch;
+    background: linear-gradient(180deg, rgba(12,22,31,0.95), rgba(7,13,19,0.86));
+    border-bottom: 1px solid rgba(41,182,246,0.14);
+  }
+  /* pywebview drags the window by anything inside .pywebview-drag-region, so the
+     region is a sibling of the buttons and never their ancestor. */
+  .drag { flex: 1 1 auto; display: flex; align-items: center; gap: 14px; padding: 0 14px; min-width: 0; }
+  .mark { font-size: 12px; letter-spacing: 0.40em; color: var(--ink); font-weight: 600; }
+  .link { display: flex; align-items: center; gap: 7px; font-size: 10.5px; letter-spacing: 0.18em;
+          text-transform: uppercase; color: var(--dim); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); transition: background .3s, box-shadow .3s; }
+  .dot.on { background: var(--speaking); box-shadow: 0 0 9px var(--speaking); }
+  .winbtns { display: flex; align-items: stretch; }
+  .winbtn {
+    width: 46px; display: grid; place-items: center; color: var(--dim);
+    transition: background .15s ease, color .15s ease;
+  }
+  .winbtn svg { width: 15px; height: 15px; }
+  .winbtn:hover { background: rgba(41,182,246,0.14); color: var(--ink); }
+  .winbtn.close:hover { background: rgba(255,111,96,0.22); color: #ffe2de; }
+
+  /* --- the confirmation bar ------------------------------------------------- */
+  #confirm {
+    position: relative; z-index: 2; flex: 0 0 auto; overflow: hidden;
+    display: flex; align-items: center; gap: 14px; padding: 11px 14px 12px;
+    background: linear-gradient(180deg, rgba(58,42,8,0.96), rgba(30,22,6,0.92));
+    border-bottom: 1px solid rgba(255,179,0,0.45);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+    animation: dropIn .22s cubic-bezier(.2,.9,.3,1.2);
+  }
+  #confirm[hidden] { display: none; }
+  @keyframes dropIn { from { transform: translateY(-100%); opacity: 0; } to { transform: none; opacity: 1; } }
+  #confirm .warn {
+    flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%;
+    display: grid; place-items: center; color: #0a0a08; background: var(--thinking);
+    font-weight: 700; font-size: 16px; animation: throb 1.3s ease-in-out infinite;
+  }
+  @keyframes throb { 0%,100% { box-shadow: 0 0 0 0 rgba(255,179,0,0.5); } 50% { box-shadow: 0 0 0 7px rgba(255,179,0,0); } }
+  #confirm .what { flex: 1 1 auto; min-width: 0; }
+  #confirmText { font-size: 15px; color: #ffe9bd; }
+  #confirm .cue { font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: rgba(255,233,189,0.55); }
+  #confirmLeft { font: 500 13px/1 var(--mono); color: var(--thinking); font-variant-numeric: tabular-nums; }
+  #confirmFuse { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--thinking); width: 100%; }
+  .btn {
+    padding: 9px 18px; border-radius: 10px; font-size: 14px; letter-spacing: 0.04em;
+    border: 1px solid var(--edge); background: var(--panel); transition: filter .15s ease, background .15s ease;
+  }
+  .btn:hover { filter: brightness(1.25); }
+  .btn:focus-visible { outline: 2px solid rgba(255,233,189,0.8); outline-offset: 2px; }
+  .btn:disabled { opacity: .45; cursor: default; filter: none; }
+  .btn.go { background: var(--thinking); border-color: var(--thinking); color: #14100a; font-weight: 600; }
+  .btn.calm { background: transparent; border-color: rgba(255,233,189,0.28); color: rgba(255,233,189,0.75); }
+
+  /* --- the two columns ------------------------------------------------------ */
+  main {
+    position: relative; z-index: 1; flex: 1 1 auto; min-height: 0;
+    display: grid; grid-template-columns: minmax(0, 1fr) 322px; gap: 14px; padding: 12px 14px 0;
+  }
+  /* Narrower than a desk window has any business being: one column, the whole page
+     scrolls, and nothing is allowed to keep a height it was given for two. */
+  @media (max-width: 899px) {
+    main { grid-template-columns: minmax(0, 1fr); grid-auto-rows: min-content; overflow-y: auto; }
+    .theatre, .instruments { min-height: 0; overflow: visible; }
+    .instruments { mask-image: none; -webkit-mask-image: none; }
+    #feed { min-height: 200px; }
+  }
+
+  .theatre { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .instruments {
+    display: flex; flex-direction: column; gap: 9px; min-height: 0; overflow-y: auto; padding-right: 2px;
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent);
+  }
+
+  .panel {
+    flex: 0 0 auto;
+    background: var(--panel); border: 1px solid rgba(255,255,255,0.05); border-radius: 14px;
+    padding: 9px 11px 10px;
+  }
+  .panel > h2 {
+    margin: 0 0 7px; font-size: 10px; font-weight: 600; letter-spacing: 0.26em;
+    text-transform: uppercase; color: var(--dim);
+  }
+
+  /* --- the theatre: reactor, working line, feed ----------------------------- */
+  .stage { display: flex; flex-direction: column; align-items: center; flex: 0 0 auto; }
+  #talk {
+    width: var(--ring); height: var(--ring); padding: 0; border-radius: 50%;
+    display: block; transition: transform .14s ease, filter .2s ease;
+  }
+  #talk:hover { filter: brightness(1.12); }
+  #talk:active { transform: scale(0.97); }
+  #talk:focus-visible { outline: 1px solid var(--accent); outline-offset: 6px; }
+  .ring { width: 100%; height: 100%; display: block; }
+  .ring .coil, .ring .sweep { transform-origin: 50% 50%; }
+  .ring .core, .ring .bloom { transition: opacity .35s ease, r .35s ease; }
+  .ring .sweep { opacity: 0; transform-origin: 50% 50%; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes breathe { 0%,100% { opacity: .42 } 50% { opacity: .78 } }
+  @keyframes corebeat { 0%,100% { opacity: .75 } 50% { opacity: 1 } }
+  /* a wave leaving the core, which is what a voice looks like */
+  @keyframes outward {
+    0%   { r: 8;  opacity: .55; }
+    100% { r: 37; opacity: 0; }
+  }
+
+  /* idle: dim, breathing, almost still */
+  body[data-state="idle"] .coil  { animation: spin 60s linear infinite; opacity: .5; }
+  body[data-state="idle"] .halo  { animation: breathe 4.5s ease-in-out infinite; }
+  body[data-state="idle"] .core  { opacity: .6; }
+  body[data-state="idle"] .bloom { opacity: .5; }
+
+  /* listening: bright and awake */
+  body[data-state="listening"] .coil { animation: spin 26s linear infinite; opacity: 1; }
+  body[data-state="listening"] .halo { opacity: .85; }
+  body[data-state="listening"] .core { animation: corebeat 1.4s ease-in-out infinite; }
+
+  /* working: a comet sweeping the ring */
+  body[data-state="thinking"] .coil  { animation: spin 9s linear infinite; opacity: .55; }
+  body[data-state="thinking"] .sweep { opacity: 1; animation: spin 1.1s linear infinite; }
+  body[data-state="thinking"] .halo  { opacity: .7; }
+
+  /* speaking: waves leaving the core */
+  body[data-state="speaking"] .coil  { animation: spin 40s linear infinite reverse; opacity: .95; }
+  body[data-state="speaking"] .wave  { animation: outward 1.5s ease-out infinite; }
+  body[data-state="speaking"] .core  { animation: corebeat .9s ease-in-out infinite; }
+  body[data-state="speaking"] .halo  { animation: breathe 1.4s ease-in-out infinite; }
+
+  /* paused: grey and still */
+  body[data-state="paused"] .coil  { opacity: .3; }
+  body[data-state="paused"] .core  { opacity: .4; }
+  body[data-state="paused"] .bloom { opacity: .3; }
+
+  .caption {
+    margin-top: 2px; font-size: 11.5px; letter-spacing: 0.34em; text-transform: uppercase;
+    color: var(--accent); transition: color .3s;
+  }
+  .under { display: flex; align-items: center; gap: 10px; min-height: 22px; margin-top: 3px; }
+  .note { font-size: 12.5px; color: var(--thinking); text-align: center; max-width: 420px; }
+  #halt {
+    display: none; padding: 3px 11px; border-radius: 11px; font-size: 11px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--dim); border: 1px solid rgba(255,255,255,0.09);
+  }
+  #halt:hover { color: var(--bad); border-color: rgba(255,111,96,0.4); }
+  body[data-state="thinking"] #halt, body[data-state="speaking"] #halt { display: block; }
+
+  /* the working line: heard -> thinking -> tools -> answer -> latency */
+  /* It wraps rather than scrolls: a turn you cannot see the beginning of is not a
+     record of the turn. Two rows hold a long one; beyond that it scrolls down. */
+  #work {
+    flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: safe center;
+    column-gap: 15px; row-gap: 5px; max-height: 76px;
+    margin: 0 0 8px; padding: 11px 2px 2px; border-top: 1px solid rgba(255,255,255,0.05);
+    overflow-x: hidden; overflow-y: auto; scrollbar-width: none;
+  }
+  #work::-webkit-scrollbar { display: none; }
+  .step {
+    position: relative; flex: 0 0 auto; display: flex; align-items: baseline; gap: 7px; max-width: 330px;
+    padding: 5px 11px; border-radius: 11px; border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(12,22,30,0.55); white-space: nowrap;
+  }
+  .step + .step::before {
+    content: ""; position: absolute; left: -11px; top: 50%; width: 7px; height: 1px;
+    background: rgba(255,255,255,0.16);
+  }
+  .step .s-k { font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--dim); }
+  .step .s-v { font-size: 13px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
+  .step .s-ms { font: 500 10.5px/1 var(--mono); color: var(--dim); font-variant-numeric: tabular-nums; }
+  .step.live { border-color: rgba(255,179,0,0.35); background: rgba(255,179,0,0.08); animation: pulse 1.3s ease-in-out infinite; }
+  .step.live .s-k { color: var(--thinking); }
+  .step.done { border-color: var(--edge); }
+  .step.done .s-k { color: var(--listening); }
+  .step.bad { border-color: rgba(255,111,96,0.4); }
+  .step.bad .s-k { color: var(--bad); }
+  .step.latency { border-color: rgba(62,224,200,0.35); background: rgba(62,224,200,0.08); }
+  .step.latency .s-k, .step.latency .s-v { color: var(--speaking); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .step.waiting { border-style: dashed; border-color: rgba(255,255,255,0.08); }
+  .step.waiting .s-k { color: var(--dim); }
+  @keyframes pulse { 0%,100% { opacity: .62 } 50% { opacity: 1 } }
+
+  /* the feed */
+  #feed {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 4px 8px 2px;
+    display: flex; flex-direction: column; gap: 8px;
+    mask-image: linear-gradient(to bottom, transparent, #000 16px);
+    -webkit-mask-image: linear-gradient(to bottom, transparent, #000 16px);
+  }
+  /* At the top rather than dead centre: the space below then reads as room for the
+     conversation to grow into, which is what it is. */
+  #feed:empty::before {
+    content: "Say Hey JARVIS, click the reactor, or type below.";
+    margin: 16px auto auto; font-size: 13px; color: var(--dim); text-align: center;
+  }
+  .line { padding: 9px 13px; border-radius: 15px; max-width: 78%; font-size: 14.5px; user-select: text; }
+  .line.you { align-self: flex-end; background: rgba(41,182,246,0.14); border: 1px solid var(--edge); border-bottom-right-radius: 5px; }
+  .line.him { align-self: flex-start; background: var(--panel); border: 1px solid rgba(255,255,255,0.05); border-bottom-left-radius: 5px; }
+  .line.err { align-self: center; background: rgba(255,111,96,0.13); color: #ffd9d4; border: 1px solid rgba(255,111,96,0.3); font-size: 13.5px; }
+  .line.sys { align-self: center; background: none; color: var(--dim); font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; padding: 2px 0; }
+
+  /* cards: the phone's vocabulary, with a running state the phone never sees */
+  .card {
+    align-self: stretch; background: var(--panel-2); border: 1px solid var(--edge);
+    border-left: 3px solid var(--listening); border-radius: 14px; padding: 9px 12px 10px;
+    display: flex; flex-direction: column; gap: 6px; user-select: text;
+  }
+  .card.running { border-left-color: var(--thinking); }
+  .card.running .card-body { height: 10px; border-radius: 5px; overflow: hidden; background: rgba(255,179,0,0.08); }
+  .card.running .card-body::after {
+    content: ""; display: block; width: 38%; height: 100%; border-radius: 5px;
+    background: linear-gradient(90deg, transparent, rgba(255,179,0,0.38), transparent);
+    animation: sweepacross 1.25s ease-in-out infinite;
+  }
+  @keyframes sweepacross { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+  .card.failed  { border-left-color: var(--thinking); }
+  .card.refused { border-left-color: var(--bad); }
+  .card-head { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--dim); }
+  .card-head .glyph { font-size: 14px; color: var(--listening); letter-spacing: 0; }
+  .card.running .glyph { color: var(--thinking); }
+  .card.failed .glyph { color: var(--thinking); }
+  .card.refused .glyph { color: var(--bad); }
+  .card-head .chip { margin-left: auto; font: 500 10px/1 var(--mono); letter-spacing: 0.1em; padding: 4px 7px; border-radius: 8px; background: rgba(41,182,246,0.12); color: var(--listening); }
+  .card.running .chip { background: rgba(255,179,0,0.12); color: var(--thinking); }
+  .card.failed .chip  { background: rgba(255,179,0,0.12); color: var(--thinking); }
+  .card.refused .chip { background: rgba(255,111,96,0.14); color: var(--bad); }
+  .card-title { font-size: 16px; font-weight: 600; }
+  .card-big { font: 500 32px/1 var(--mono); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .card-sub { font-size: 13px; color: var(--dim); }
+  .card-row { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; color: var(--dim); }
+  .card-row b { color: var(--ink); font-weight: 500; font-family: var(--mono); }
+  .card-text { font-size: 14px; }
+  .card-actions { display: flex; gap: 8px; margin-top: 2px; }
+  .card-actions a, .card-actions button {
+    flex: 0 1 auto; text-align: center; text-decoration: none; padding: 7px 14px; border-radius: 10px;
+    background: rgba(41,182,246,0.16); border: 1px solid var(--edge); color: var(--ink); font-size: 13px;
+  }
+  .card-actions a.primary { background: rgba(62,224,200,0.18); border-color: rgba(62,224,200,0.35); }
+  .card-actions a:hover, .card-actions button:hover { filter: brightness(1.3); }
+  .card-list { display: flex; flex-direction: column; gap: 6px; }
+  .card-list a { color: var(--ink); text-decoration: none; display: block; font-size: 14px; cursor: pointer; }
+  .card-list a:hover { color: var(--listening); }
+  .card-list a small { display: block; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* --- the instruments ------------------------------------------------------ */
+  #tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+  .tile {
+    background: rgba(8,15,21,0.55); border: 1px solid rgba(255,255,255,0.05); border-radius: 11px;
+    padding: 6px 8px 7px; display: flex; flex-direction: column; gap: 0; min-width: 0;
+  }
+  .tile .k { font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--dim); }
+  .tile .v { font: 500 16px/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+  .tile .s { font-size: 10px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #tModel .v { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tile.hot .v { color: var(--thinking); }
+  .tile.live .v { color: var(--speaking); }
+
+  #timers { display: flex; flex-direction: column; gap: 6px; }
+  .job { display: flex; align-items: center; gap: 9px; padding: 5px 4px 5px 8px; border-radius: 10px; background: rgba(8,15,21,0.5); }
+  .job .what { flex: 1 1 auto; min-width: 0; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .job .left { font: 500 14px/1 var(--mono); color: var(--speaking); font-variant-numeric: tabular-nums; }
+  .job .drop { width: 24px; height: 24px; border-radius: 7px; color: var(--dim); font-size: 15px; line-height: 1; }
+  .job .drop:hover { background: rgba(255,111,96,0.18); color: var(--bad); }
+  .job.going { opacity: .45; }
+  .empty { font-size: 12.5px; color: var(--dim); }
+
+  #routines { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+  #routines::-webkit-scrollbar { display: none; }
+  #routines button { flex: 0 0 auto; white-space: nowrap; }
+  #routines button {
+    padding: 7px 13px; border-radius: 16px; background: rgba(8,15,21,0.5);
+    border: 1px solid var(--edge); font-size: 13px;
+  }
+  #routines button:hover { background: rgba(41,182,246,0.18); }
+  #routines button:disabled { opacity: .5; }
+
+  .pref { display: flex; align-items: center; gap: 10px; padding: 3px 0; font-size: 13px; color: var(--ink); }
+  .pref.pair { gap: 8px; }
+  .pref.pair .lbl { flex: 1 1 0; }
+  .pref .lbl { flex: 1 1 auto; }
+  .sw {
+    flex: 0 0 auto; width: 38px; height: 21px; border-radius: 11px; position: relative;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.09); transition: background .2s ease;
+  }
+  .sw::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%;
+    background: var(--dim); transition: transform .18s ease, background .18s ease;
+  }
+  .sw[data-on="1"] { background: rgba(62,224,200,0.28); border-color: rgba(62,224,200,0.4); }
+  .sw[data-on="1"]::after { transform: translateX(17px); background: var(--speaking); }
+  .sw.unknown { opacity: .45; }
+  input[type="range"] { flex: 0 0 116px; accent-color: var(--listening); height: 20px; }
+  .pref .num { font: 500 12px/1 var(--mono); color: var(--dim); width: 30px; text-align: right; font-variant-numeric: tabular-nums; }
+  .controls { display: flex; gap: 7px; margin-top: 8px; }
+  .controls button { flex: 1 1 0; padding: 7px 0; border-radius: 10px; border: 1px solid rgba(255,255,255,0.08); font-size: 12.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); }
+  .controls button:hover { color: var(--ink); border-color: var(--edge); background: rgba(41,182,246,0.12); }
+  #quit.armed { color: var(--bad); border-color: rgba(255,111,96,0.45); background: rgba(255,111,96,0.12); }
+
+  /* --- the composer, the facts, the drawer ---------------------------------- */
+  footer { position: relative; z-index: 1; flex: 0 0 auto; padding: 10px 14px 10px; }
+  #composer { display: flex; gap: 8px; align-items: center; }
+  #text {
+    flex: 1 1 auto; min-width: 0; height: 42px; padding: 0 16px; border-radius: 21px;
+    background: var(--panel); border: 1px solid var(--edge); color: var(--ink); font: inherit; outline: none;
+  }
+  #text:focus { border-color: rgba(41,182,246,0.55); background: rgba(18,30,40,0.85); }
+  #text::placeholder { color: var(--dim); }
+  #send {
+    flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%; border: 1px solid var(--edge);
+    background: rgba(41,182,246,0.18); display: grid; place-items: center;
+  }
+  #send:hover { background: rgba(41,182,246,0.3); }
+  #send:disabled { opacity: .4; }
+  #send svg { width: 18px; height: 18px; }
+  .facts {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin-top: 8px; font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim);
+  }
+  .facts .fact b { font-weight: 500; color: rgba(216,236,247,0.72); letter-spacing: 0.06em; }
+  .facts .sp { flex: 1 1 auto; }
+  #drawerToggle { font-size: 10.5px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--dim); }
+  #drawerToggle:hover { color: var(--ink); }
+  #drawerToggle .badge { color: var(--bad); font-family: var(--mono); letter-spacing: 0; }
+  #onlyProblems { font-size: 10.5px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--dim); }
+  #onlyProblems[data-on="1"] { color: var(--thinking); }
+  #drawer {
+    margin-top: 8px; height: 172px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(4,8,11,0.75); overflow-y: auto; padding: 7px 10px;
+  }
+  #drawer[hidden] { display: none; }
+  #logLines { display: flex; flex-direction: column; gap: 2px; }
+  .lg { display: flex; gap: 9px; font: 11.5px/1.5 var(--mono); color: var(--dim); user-select: text; }
+  .lg .lg-l { flex: 0 0 34px; color: rgba(111,132,148,0.7); }
+  .lg .lg-n { flex: 0 0 110px; color: rgba(41,182,246,0.55); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lg .lg-t { flex: 1 1 auto; color: rgba(216,236,247,0.72); word-break: break-word; }
+  .lg[data-level="WARNING"] .lg-t { color: var(--thinking); }
+  .lg[data-level="ERROR"] .lg-t, .lg[data-level="CRITICAL"] .lg-t { color: var(--bad); }
+  #drawer[data-filter="1"] .lg[data-level="INFO"],
+  #drawer[data-filter="1"] .lg[data-level="DEBUG"] { display: none; }
+</style>
+</head>
+<body data-state="idle">
+
+<header id="bar">
+  <div class="drag pywebview-drag-region">
+    <span class="mark">J.A.R.V.I.S.</span>
+    <span class="link"><span id="dot" class="dot"></span><span id="linkText">offline</span></span>
+  </div>
+  <div class="winbtns nodrag">
+    <button id="min" class="winbtn nodrag" type="button" title="Minimise" aria-label="Minimise">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 8.5h10"/></svg>
+    </button>
+    <button id="close" class="winbtn close nodrag" type="button"
+            title="Close to the tray. I shall still be listening, sir." aria-label="Close to the tray">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+    </button>
+  </div>
+</header>
+
+<section id="confirm" hidden aria-live="assertive">
+  <div class="warn">!</div>
+  <div class="what">
+    <div class="cue">Your word, sir</div>
+    <div id="confirmText"></div>
+  </div>
+  <div id="confirmLeft">--</div>
+  <button id="confirmNo" class="btn calm" type="button">Cancel</button>
+  <button id="confirmYes" class="btn go" type="button">Confirm</button>
+  <div id="confirmFuse"></div>
+</section>
+
+<main>
+  <section class="theatre">
+    <div class="stage">
+      <button id="talk" type="button" aria-label="Listen to me">
+        <svg class="ring" viewBox="0 0 100 100" aria-hidden="true">
+          <defs>
+            <radialGradient id="halo-g">
+              <stop offset="55%" stop-color="var(--accent)" stop-opacity="0"/>
+              <stop offset="82%" stop-color="var(--accent)" stop-opacity="0.30"/>
+              <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+            </radialGradient>
+            <radialGradient id="core-g">
+              <stop offset="0%" stop-color="#ffffff" stop-opacity="1"/>
+              <stop offset="38%" stop-color="#ffffff" stop-opacity="0.85"/>
+              <stop offset="70%" stop-color="var(--accent)" stop-opacity="0.45"/>
+              <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+            </radialGradient>
+            <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="1.6" result="b"/>
+              <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+
+          <!-- outer glow -->
+          <circle class="halo" cx="50" cy="50" r="50" fill="url(#halo-g)"/>
+
+          <!-- the eight coils, as one dashed band -->
+          <g class="coil" filter="url(#glow)">
+            <circle cx="50" cy="50" r="29.05" fill="none" stroke="var(--accent)"
+                    stroke-width="11.90" stroke-dasharray="18.25 4.56" opacity="0.9"/>
+          </g>
+
+          <!-- a comet that sweeps the band while he is working -->
+          <g class="sweep">
+            <circle cx="50" cy="50" r="29.05" fill="none" stroke="#ffffff"
+                    stroke-width="11.90" stroke-linecap="round"
+                    stroke-dasharray="20.53 182.53" opacity="0.5"/>
+          </g>
+
+          <!-- outer rim and inner ring -->
+          <circle class="rim" cx="50" cy="50" r="37.2" fill="none"
+                  stroke="var(--accent)" stroke-width="2.4" opacity="0.75" filter="url(#glow)"/>
+          <circle class="inner" cx="50" cy="50" r="19.1" fill="none"
+                  stroke="var(--accent)" stroke-width="2.6" opacity="0.9" filter="url(#glow)"/>
+
+          <!-- a wave leaving the core while he speaks -->
+          <circle class="wave" cx="50" cy="50" r="8" fill="none"
+                  stroke="var(--accent)" stroke-width="1.6" opacity="0"/>
+
+          <!-- the white-hot core -->
+          <circle class="bloom" cx="50" cy="50" r="14.2" fill="url(#core-g)"/>
+          <circle class="core" cx="50" cy="50" r="7.5" fill="#ffffff" opacity="0.95"/>
+        </svg>
+      </button>
+      <div class="caption" id="caption">standing by</div>
+      <div class="under">
+        <div class="note" id="note"></div>
+        <button id="halt" type="button" title="Stop speaking and drop this turn (Escape)">halt</button>
+      </div>
+    </div>
+
+    <div id="work" aria-label="This turn"></div>
+
+    <div id="feed" aria-live="polite"></div>
+  </section>
+
+  <aside class="instruments">
+    <section class="panel">
+      <h2>Machine</h2>
+      <div id="tiles">
+        <div class="tile" id="tCpu"><span class="k">CPU</span><span class="v">--</span><span class="s"></span></div>
+        <div class="tile" id="tRam"><span class="k">RAM</span><span class="v">--</span><span class="s"></span></div>
+        <div class="tile" id="tGpu"><span class="k">GPU</span><span class="v">--</span><span class="s"></span></div>
+        <div class="tile" id="tTemp"><span class="k">GPU &deg;C</span><span class="v">--</span><span class="s"></span></div>
+        <div class="tile" id="tVram"><span class="k">VRAM</span><span class="v">--</span><span class="s"></span></div>
+        <div class="tile" id="tModel"><span class="k">Model</span><span class="v">--</span><span class="s"></span></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Timers and reminders</h2>
+      <div id="timers"><div class="empty">Nothing pending.</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>Routines</h2>
+      <div id="routines"><div class="empty">None configured.</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>Preferences</h2>
+      <div class="pref pair"><span class="lbl">Brief</span>
+        <button id="swBrief" class="sw unknown" type="button" data-on="0" role="switch"
+                aria-checked="false" aria-label="Brief replies" title="Answer with a tone when a tool simply worked"></button>
+        <span class="lbl">Ring on top</span>
+        <button id="swTop" class="sw unknown" type="button" data-on="0" role="switch"
+                aria-checked="false" aria-label="Ring always on top" title="Keep the arc reactor above other windows"></button></div>
+      <div class="pref"><span class="lbl">Voice speed</span>
+        <input id="speed" type="range" min="0.5" max="1.6" step="0.05" value="1">
+        <span class="num" id="speedValue">1.00</span></div>
+      <div class="controls">
+        <button id="pause" type="button">Pause</button>
+        <button id="quit" type="button" title="Shut JARVIS down entirely">Stand down</button>
+      </div>
+    </section>
+  </aside>
+</main>
+
+<footer>
+  <form id="composer" autocomplete="off">
+    <input id="text" type="text" placeholder="Type a turn, sir" maxlength="2000" spellcheck="false">
+    <button id="send" type="submit" aria-label="Send" title="Send (Enter)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 19V5"/><path d="M6 11l6-6 6 6"/>
+      </svg>
+    </button>
+  </form>
+  <div class="facts" id="facts">
+    <span class="sp"></span>
+    <button id="onlyProblems" type="button" data-on="0" title="Show warnings and errors only">problems only</button>
+    <button id="drawerToggle" type="button" aria-expanded="false">log</button>
+  </div>
+  <div id="drawer" hidden><div id="logLines"></div></div>
+</footer>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ the window */
+const el = (id) => document.getElementById(id);
+const ui = {
+  body: document.body,
+  dot: el("dot"), linkText: el("linkText"),
+  talk: el("talk"), caption: el("caption"), note: el("note"), halt: el("halt"),
+  work: el("work"), feed: el("feed"),
+  tiles: { cpu: el("tCpu"), ram: el("tRam"), gpu: el("tGpu"), temp: el("tTemp"), vram: el("tVram"), model: el("tModel") },
+  timers: el("timers"), routines: el("routines"),
+  brief: el("swBrief"), onTop: el("swTop"), speed: el("speed"), speedValue: el("speedValue"),
+  pause: el("pause"), quit: el("quit"),
+  composer: el("composer"), text: el("text"), send: el("send"),
+  facts: el("facts"), drawer: el("drawer"), logLines: el("logLines"),
+  drawerToggle: el("drawerToggle"), onlyProblems: el("onlyProblems"),
+  confirm: el("confirm"), confirmText: el("confirmText"), confirmLeft: el("confirmLeft"),
+  confirmFuse: el("confirmFuse"), confirmYes: el("confirmYes"), confirmNo: el("confirmNo"),
+  min: el("min"), close: el("close")
+};
+
+const app = {
+  ws: null,            // the one socket; everything in and out goes through it
+  tries: 0,
+  state: "idle",
+  turn: null,          // the working line's model for the turn in flight
+  running: new Map(),  // tool name -> the card still waiting for its "end"
+  replyOpen: false,
+  timersKey: "",       // the timer list is only rebuilt when it actually changes
+  problems: 0,
+  quitArmed: null
+};
+
+const CAPTIONS = {
+  idle: "standing by", listening: "listening", thinking: "working",
+  speaking: "speaking", paused: "paused"
+};
+const MAX_FEED = 60;
+const MAX_LOG = 300;
+
+/* -------------------------------------------------------------- small helpers */
+function node(tag, className, text) {
+  const made = document.createElement(tag);
+  if (className) made.className = className;
+  if (text !== undefined && text !== null && text !== "") made.textContent = String(text);
+  return made;
+}
+function clip(text, limit) {
+  const clean = String(text || "").trim();
+  return clean.length > limit ? clean.slice(0, limit - 1) + "…" : clean;
+}
+function post(element) {
+  ui.feed.appendChild(element);
+  while (ui.feed.children.length > MAX_FEED) ui.feed.removeChild(ui.feed.firstChild);
+  ui.feed.scrollTop = ui.feed.scrollHeight;
+  return element;
+}
+function addLine(kind, text) {
+  if (!text) return null;
+  return post(node("div", "line " + kind, text));
+}
+function appendReply(text) {
+  const last = ui.feed.lastElementChild;
+  /* A refusal is spoken as well as reported; the card already says it. */
+  if (last && last.classList.contains("card") && last.dataset.summary === text) return;
+  if (app.replyOpen && last && last.classList.contains("him")) {
+    last.textContent = (last.textContent + " " + text).trim();
+    ui.feed.scrollTop = ui.feed.scrollHeight;
+  } else {
+    addLine("him", text);
+    app.replyOpen = true;
+  }
+}
+/* The note line is for things that went wrong, not for narration: the reactor and
+   the working line already say what he is doing. */
+function notice(text) { ui.note.textContent = text || ""; }
+
+/* ------------------------------------------------------------------- the wire */
+function wsUrl(path) {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  return scheme + "//" + location.host + path;
+}
+function setLink(up, text) {
+  ui.dot.classList.toggle("on", !!up);
+  ui.linkText.textContent = text || (up ? "linked" : "offline");
+}
+
+/* Every frame the window sends. False means it went nowhere, and the caller may
+   want to say so rather than pretend the click worked. */
+function send(frame) {
+  const socket = app.ws;
+  if (!socket || socket.readyState !== 1) {
+    notice("I have lost the link to myself, sir.");
+    return false;
+  }
+  try {
+    socket.send(JSON.stringify(frame));
+    return true;
+  } catch (err) {
+    notice("That did not reach me, sir.");
+    return false;
+  }
+}
+
+function connect() {
+  if (app.ws && app.ws.readyState <= 1) return;
+  let socket;
+  try {
+    socket = new WebSocket(wsUrl("/ws/desk"));
+  } catch (err) {
+    retry();
+    return;
+  }
+  app.ws = socket;
+  socket.onopen = () => { app.tries = 0; setLink(true, "linked"); };
+  socket.onmessage = (event) => {
+    let message = null;
+    try { message = JSON.parse(event.data); } catch (err) { return; }
+    if (message && typeof message === "object") onDeskMessage(message);
+  };
+  socket.onclose = () => {
+    if (app.ws === socket) app.ws = null;
+    retry();
+  };
+  socket.onerror = () => { try { socket.close(); } catch (err) { /* already gone */ } };
+}
+function retry() {
+  app.tries += 1;
+  setLink(false, app.tries > 1 ? "reconnecting" : "offline");
+  setTimeout(connect, Math.min(600 * app.tries, 8000));
+}
+
+/* Every inbound frame in the contract has a branch here and nothing else does.
+   An unknown frame is ignored on purpose: a newer JARVIS talking to an older
+   window should lose a feature, not a window. */
+function onDeskMessage(message) {
+  switch (message.type) {
+    case "hello":        onHello(message); break;
+    case "state":        setState(message.state); break;
+    case "heard":        onHeard(message.text); break;
+    case "sentence":     onSentence(message.text); break;
+    case "tool":         onTool(message); break;
+    case "confirm":      showConfirm(message.announcement, message.seconds); break;
+    case "confirm_done": hideConfirm(!!message.granted); break;
+    case "latency":      onLatency(message.ms, message.marks); break;
+    case "note":         notice(message.text); break;
+    case "log":          onLog(message); break;
+    case "status":       drawStatus(message); break;
+    case "error":        notice(message.message || "Something went wrong, sir."); break;
+    case "busy":         notice(message.message || "I am in the middle of something, sir."); break;
+    default:             break; /* ping, ack, closed: nothing to draw */
+  }
+}
+
+/* hello is also the page's reset. The server replays the conversation right
+   behind it, so a reconnected window must start from an empty feed or it would
+   show every line twice. */
+function onHello(message) {
+  ui.feed.textContent = "";
+  ui.work.textContent = "";
+  app.turn = null;
+  app.running.clear();
+  app.replyOpen = false;
+  drawWork();
+  drawFacts(message);
+  drawRoutines(message.routines);
+  drawSettings(message.settings);
+  if (message.model) drawTile(ui.tiles.model, message.model, "");
+  setState(message.paused ? "paused" : (message.state || "idle"));
+  setLink(true, "linked");
+}
+
+function drawFacts(message) {
+  const facts = [];
+  if (message.version) facts.push(["build", "v" + message.version]);
+  if (message.whisper) facts.push(["whisper", message.whisper]);
+  if (message.gpu) facts.push(["gpu", message.gpu]);
+  if (message.phone_url) facts.push(["phone", String(message.phone_url).replace(/^\w+:\/\//, "")]);
+  if (Array.isArray(message.tools) && message.tools.length) facts.push(["abilities", message.tools.length]);
+  ui.facts.querySelectorAll(".fact").forEach((old) => old.remove());
+  const spacer = ui.facts.querySelector(".sp");
+  facts.forEach(([key, value]) => {
+    const fact = node("span", "fact", key + " ");
+    fact.appendChild(node("b", "", value));
+    ui.facts.insertBefore(fact, spacer);
+  });
+  if (Array.isArray(message.tools) && message.tools.length) {
+    ui.facts.title = message.tools.map((tool) => tool && tool.name).filter(Boolean).join(", ");
+  }
+}
+
+/* ------------------------------------------------------------- the reactor */
+function setState(state) {
+  const known = ["idle", "listening", "thinking", "speaking", "paused"];
+  const value = known.indexOf(state) >= 0 ? state : "idle";
+  app.state = value;
+  ui.body.dataset.state = value;
+  document.documentElement.style.setProperty("--accent", "var(--" + value + ")");
+  ui.caption.textContent = CAPTIONS[value];
+  ui.pause.textContent = value === "paused" ? "Resume" : "Pause";
+}
+
+/* ------------------------------------------------- the working line of a turn */
+function newTurn(heard) {
+  return { heard: heard || "", thinking: false, tools: [], answered: false, ms: null, marks: null };
+}
+function step(kind, label, value, trailing) {
+  const made = node("div", "step " + kind);
+  made.appendChild(node("span", "s-k", label));
+  if (value) made.appendChild(node("span", "s-v", value));
+  if (trailing) made.appendChild(node("span", "s-ms", trailing));
+  return made;
+}
+function marksText(marks) {
+  if (!marks || typeof marks !== "object") return "";
+  return Object.keys(marks).map((key) => key + " " + Math.round(Number(marks[key])) + " ms").join("  ·  ");
+}
+function drawWork() {
+  const turn = app.turn;
+  ui.work.textContent = "";
+  if (!turn) {
+    ui.work.appendChild(step("waiting", "no turn in flight", "", ""));
+    return;
+  }
+  if (turn.heard) ui.work.appendChild(step("done", "heard", clip(turn.heard, 44), ""));
+  if (turn.thinking) {
+    ui.work.appendChild(step(turn.answered ? "done" : "live", "thinking", "", ""));
+  }
+  turn.tools.forEach((tool) => {
+    const kind = !tool.done ? "live" : (tool.ok ? "done" : "bad");
+    ui.work.appendChild(step(kind, prettify(tool.name), "", tool.ms ? tool.ms + " ms" : ""));
+  });
+  if (turn.answered) ui.work.appendChild(step("done", "answered", "", ""));
+  if (turn.ms !== null) {
+    const badge = step("latency", "voice in", turn.ms + " ms", "");
+    badge.title = marksText(turn.marks) || "End of speech to the first audio out.";
+    ui.work.appendChild(badge);
+  }
+  ui.work.scrollTop = ui.work.scrollHeight;
+}
+
+function onHeard(text) {
+  const heard = String(text || "").trim();
+  app.turn = newTurn(heard);
+  app.turn.thinking = true;
+  app.replyOpen = false;
+  notice("");
+  /* A typed turn was already echoed into the feed when it was sent. */
+  const last = ui.feed.lastElementChild;
+  const echoed = last && last.classList.contains("you") && last.textContent === heard;
+  if (!echoed) addLine("you", heard);
+  drawWork();
+}
+function onSentence(text) {
+  if (!text) return;
+  if (app.turn) { app.turn.answered = true; drawWork(); }
+  appendReply(String(text));
+}
+function onLatency(ms, marks) {
+  const value = Math.round(Number(ms));
+  if (!isFinite(value)) return;
+  if (!app.turn) app.turn = newTurn("");
+  app.turn.ms = value;
+  app.turn.marks = marks || null;
+  drawWork();
+}
+
+/* ------------------------------------------------------------------ the cards */
+/* One card per tool call, in the phone's vocabulary. The desk draws it the moment
+   the call starts and finishes it in place, so a slow search is visibly working
+   rather than a blank pause. */
+const FACES = {
+  find_business: ["☎", "Business"], recall_business: ["☎", "Business"],
+  dial_number: ["☎", "Call"], end_call: ["☎", "Call"],
+  set_timer: ["◷", "Timer"], set_reminder: ["◷", "Reminder"],
+  list_timers: ["◷", "Timers"], cancel_timer: ["◷", "Timer"],
+  get_time_date: ["◷", "Clock"],
+  weather: ["☁", "Weather"], web_search: ["⌕", "Search"], open_url: ["⌕", "Web"],
+  system_status: ["▤", "System"], screenshot: ["▣", "Screenshot"],
+  open_app: ["▶", "App"], close_app: ["■", "App"],
+  media: ["♪", "Media"], volume: ["♪", "Volume"],
+  clipboard: ["⎘", "Clipboard"], remember: ["◈", "Memory"],
+  recall: ["◈", "Memory"], forget: ["◈", "Memory"],
+  file_ops: ["☰", "Files"], find_file: ["☰", "Files"],
+  run_powershell: ["❯", "PowerShell"], power: ["⏻", "Power"], lock_pc: ["⏻", "Lock"],
+  type_text: ["⌨", "Keyboard"], deep_think: ["◈", "Thinking"]
+};
+function prettify(name) { return String(name || "tool").replace(/_/g, " "); }
+function clock(epoch) {
+  const when = new Date(Number(epoch) * 1000);
+  return isNaN(when.getTime()) ? "" : when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function countdown(epoch) {
+  const left = Math.max(0, Math.round(Number(epoch) - Date.now() / 1000));
+  const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), s = left % 60;
+  const two = (n) => String(n).padStart(2, "0");
+  return h > 0 ? h + ":" + two(m) + ":" + two(s) : two(m) + ":" + two(s);
+}
+function row(pairs) {
+  const made = node("div", "card-row");
+  pairs.forEach(([label, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    const cell = node("span", "", label + " ");
+    cell.appendChild(node("b", "", value));
+    made.appendChild(cell);
+  });
+  return made.childElementCount ? made : null;
+}
+/* The phone can dial and open a page itself. The desk asks JARVIS to do it, which
+   keeps the window from ever navigating away from itself. */
+function ask(text, said) {
+  if (send({ type: "say", text: text })) {
+    addLine("you", text);
+    app.replyOpen = false;
+    if (said) notice(said);
+  }
+}
+function action(label, text, primary) {
+  const made = node("button", primary ? "primary" : "", label);
+  made.type = "button";
+  made.addEventListener("click", () => ask(text, ""));
+  return made;
+}
+function businessBody(d, body, actions) {
+  body.appendChild(node("div", "card-title", d.name));
+  if (d.address) body.appendChild(node("div", "card-sub", d.address));
+  if (d.opening_hours) body.appendChild(node("div", "card-sub", d.opening_hours));
+  if (d.phone) {
+    const call = node("button", "primary", "Ring " + d.phone);
+    call.type = "button";
+    call.addEventListener("click", () => ask("call " + d.phone, "Dialling, sir."));
+    actions.appendChild(call);
+  }
+  if (d.website) actions.appendChild(action("Website", "open " + d.website, false));
+}
+function links(items, body) {
+  const list = node("div", "card-list");
+  items.forEach((item) => {
+    if (!item) return;
+    const line = node("a", "", item.label);
+    if (item.url) {
+      line.title = item.url;
+      line.addEventListener("click", () => ask("open " + item.url, "Opening that in your browser, sir."));
+    }
+    line.appendChild(node("small", "", item.sub || ""));
+    list.appendChild(line);
+  });
+  if (!list.childElementCount) return false;
+  body.appendChild(list);
+  return true;
+}
+function cardBody(ev, body, actions) {
+  const d = ev.data || {};
+  switch (ev.name) {
+    case "find_business":
+    case "recall_business":
+      if (d.name) { businessBody(d, body, actions); return true; }
+      if (Array.isArray(d.places) && d.places.length) {
+        return links(d.places.slice(0, 4).filter((p) => p && p.name).map((place) => ({
+          label: place.name, sub: place.phone || place.address || ""
+        })), body);
+      }
+      return false;
+    case "set_timer": {
+      body.appendChild(node("div", "card-sub", d.label || "Timer"));
+      const big = node("div", "card-big", countdown(d.due));
+      big.dataset.due = String(d.due || "");
+      body.appendChild(big);
+      const meta = row([["until", clock(d.due)]]);
+      if (meta) body.appendChild(meta);
+      return true;
+    }
+    case "set_reminder":
+      body.appendChild(node("div", "card-title", d.text || "Reminder"));
+      body.appendChild(node("div", "card-sub", d.when ? d.when + (d.due ? " · " + clock(d.due) : "") : clock(d.due)));
+      return true;
+    case "list_timers":
+      if (Array.isArray(d.jobs) && d.jobs.length) {
+        d.jobs.slice(0, 5).forEach((job) => {
+          const line = node("div", "card-row");
+          line.appendChild(node("span", "", job.label || job.text || job.kind || "timer"));
+          const left = node("b", "", countdown(job.due));
+          left.dataset.due = String(job.due || "");
+          line.appendChild(left);
+          body.appendChild(line);
+        });
+        return true;
+      }
+      return false;
+    case "weather": {
+      const temp = d.temperature_c !== undefined ? Math.round(Number(d.temperature_c)) + "°" : "";
+      if (temp) body.appendChild(node("div", "card-big", temp));
+      const where = [d.condition, d.city].filter(Boolean).join(" · ");
+      if (where) body.appendChild(node("div", "card-title", where));
+      const meta = row([
+        ["high", d.high_c !== undefined ? Math.round(Number(d.high_c)) + "°" : ""],
+        ["low", d.low_c !== undefined ? Math.round(Number(d.low_c)) + "°" : ""],
+        ["wind", d.wind_ms !== undefined ? Math.round(Number(d.wind_ms)) + " m/s" : ""],
+        ["feels", d.apparent_c !== undefined ? Math.round(Number(d.apparent_c)) + "°" : ""]
+      ]);
+      if (meta) body.appendChild(meta);
+      return !!(temp || where);
+    }
+    case "system_status": {
+      const meta = row([
+        ["cpu", d.cpu_percent !== undefined ? Math.round(Number(d.cpu_percent)) + "%" : ""],
+        ["ram", d.ram_used_gb !== undefined ? d.ram_used_gb + "/" + d.ram_total_gb + " GB" : ""],
+        ["gpu", d.gpu_percent !== undefined ? Math.round(Number(d.gpu_percent)) + "%" : ""],
+        ["temp", d.gpu_temperature_c !== undefined ? Math.round(Number(d.gpu_temperature_c)) + "°C" : ""],
+        ["disk", d.disk_free_gb !== undefined ? d.disk_free_gb + " GB free" : ""]
+      ]);
+      if (meta) { body.appendChild(meta); return true; }
+      return false;
+    }
+    case "web_search":
+      if (Array.isArray(d.results) && d.results.length) {
+        return links(d.results.slice(0, 3).filter((hit) => hit && (hit.title || hit.url)).map((hit) => ({
+          label: hit.title || hit.url, sub: hit.body || hit.url || "", url: hit.url
+        })), body);
+      }
+      return false;
+    case "open_url":
+      if (d.url) {
+        body.appendChild(node("div", "card-title", d.title || d.url));
+        actions.appendChild(action("Open it again", "open " + d.url, false));
+        return true;
+      }
+      return false;
+    case "open_app":
+    case "close_app":
+      if (d.app) { body.appendChild(node("div", "card-title", d.app)); return true; }
+      return false;
+    case "get_time_date":
+      if (d.time) {
+        body.appendChild(node("div", "card-big", d.time));
+        body.appendChild(node("div", "card-sub", [d.weekday, d.date].filter(Boolean).join(" · ")));
+        return true;
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+function newCard(ev) {
+  const face = FACES[ev.name] || ["◇", prettify(ev.name)];
+  const card = node("div", "card running");
+  card.dataset.tool = String(ev.name || "");
+  const head = node("div", "card-head");
+  head.appendChild(node("span", "glyph", face[0]));
+  head.appendChild(node("span", "tool", face[1]));
+  head.appendChild(node("span", "chip", "running"));
+  card.appendChild(head);
+  card.appendChild(node("div", "card-body"));
+  return post(card);
+}
+function fillCard(card, ev) {
+  const status = ev.refused ? "refused" : ev.ok ? "done" : "failed";
+  card.className = "card" + (status === "done" ? "" : " " + status);
+  card.lastElementChild.remove();                       /* the empty running body */
+  const chip = card.querySelector(".chip");
+  chip.textContent = status + (ev.ms ? " · " + ev.ms + " ms" : "");
+  const body = node("div", "card-body");
+  const actions = node("div", "card-actions");
+  const drawn = status === "done" && cardBody(ev, body, actions);
+  if (!drawn) {
+    body.appendChild(node("div", "card-text", ev.summary || (status === "done" ? "Done." : "That did not work.")));
+    card.dataset.summary = ev.summary || "";
+  }
+  card.appendChild(body);
+  if (actions.childElementCount) card.appendChild(actions);
+  ui.feed.scrollTop = ui.feed.scrollHeight;
+  return card;
+}
+function onTool(ev) {
+  if (!app.turn) { app.turn = newTurn(""); app.turn.thinking = true; }
+  const name = String(ev.name || "");
+  if (ev.phase === "start") {
+    app.turn.tools.push({ name: name, done: false, ok: true, ms: 0 });
+    app.running.set(name, newCard(ev));
+    app.replyOpen = false;
+    drawWork();
+    return;
+  }
+  for (let i = app.turn.tools.length - 1; i >= 0; i--) {
+    const tool = app.turn.tools[i];
+    if (tool.name === name && !tool.done) {
+      tool.done = true; tool.ok = !!ev.ok && !ev.refused; tool.ms = Number(ev.ms) || 0;
+      break;
+    }
+  }
+  /* A tool whose "start" was missed (a window opened mid-turn) still gets a card. */
+  const card = app.running.get(name) || newCard(ev);
+  app.running.delete(name);
+  fillCard(card, ev);
+  app.replyOpen = false;
+  drawWork();
+}
+
+/* ---------------------------------------------------------------- the instruments */
+function drawTile(tile, value, sub, flags) {
+  tile.children[1].textContent = value;
+  if (tile.children[2]) tile.children[2].textContent = sub || "";
+  tile.classList.toggle("hot", !!(flags && flags.hot));
+  tile.classList.toggle("live", !!(flags && flags.live));
+}
+function drawStatus(s) {
+  if (!s || typeof s !== "object") return;
+  if (s.state) setState(s.state);
+  drawTile(ui.tiles.cpu, s.cpu !== undefined ? s.cpu + "%" : "--", "", { hot: s.cpu >= 85 });
+  drawTile(ui.tiles.ram, s.ram !== undefined ? s.ram + "%" : "--",
+           s.ram_used_gb !== undefined ? s.ram_used_gb + " / " + s.ram_total_gb + " GB" : "",
+           { hot: s.ram >= 90 });
+  const gpu = s.gpu || {};
+  drawTile(ui.tiles.gpu, gpu.util_percent !== undefined ? gpu.util_percent + "%" : "--", "",
+           { live: gpu.util_percent >= 25 });
+  drawTile(ui.tiles.temp, gpu.temperature_c !== undefined ? gpu.temperature_c + "°" : "--", "",
+           { hot: gpu.temperature_c >= 80 });
+  const used = gpu.vram_used_mb, total = gpu.vram_total_mb;
+  drawTile(ui.tiles.vram,
+           used !== undefined ? (used / 1024).toFixed(1) + " GB" : "--",
+           total !== undefined ? "of " + (total / 1024).toFixed(0) + " GB" : "",
+           { hot: used !== undefined && total ? used / total > 0.92 : false });
+  if (s.model) drawTile(ui.tiles.model, s.model, "");
+  drawTimers(s.timers);
+}
+
+/* The desk has a mouse, so a timer can be dropped without saying a word - but the
+   only verb the window has for it is a turn, which is exactly what a spoken
+   cancellation would have been. */
+function drawTimers(list) {
+  const jobs = (list || []).filter((job) => job && job.due).sort((a, b) => a.due - b.due);
+  const key = jobs.map((job) => job.id + ":" + job.due).join("|");
+  if (key === app.timersKey) return;
+  app.timersKey = key;
+  ui.timers.textContent = "";
+  if (!jobs.length) {
+    ui.timers.appendChild(node("div", "empty", "Nothing pending."));
+    return;
+  }
+  jobs.forEach((job) => {
+    const label = job.label || job.kind || "timer";
+    const line = node("div", "job");
+    line.appendChild(node("span", "what", label));
+    const left = node("span", "left", countdown(job.due));
+    left.dataset.due = String(job.due);
+    line.appendChild(left);
+    const drop = node("button", "drop", "×");
+    drop.type = "button";
+    drop.title = "Cancel " + label;
+    drop.addEventListener("click", () => {
+      const kind = job.kind === "reminder" ? "reminder" : "timer";
+      if (!send({ type: "say", text: "cancel the " + kind + " " + label })) return;
+      line.classList.add("going");
+      drop.disabled = true;
+      app.timersKey = "";            /* let the next status rebuild the list */
+    });
+    line.appendChild(drop);
+    ui.timers.appendChild(line);
+  });
+}
+
+function drawRoutines(routines) {
+  ui.routines.textContent = "";
+  const list = Array.isArray(routines) ? routines.filter((routine) => routine && routine.name) : [];
+  if (!list.length) {
+    ui.routines.appendChild(node("div", "empty", "None configured."));
+    return;
+  }
+  list.forEach((routine) => {
+    const button = node("button", "", routine.name);
+    button.type = "button";
+    if (Array.isArray(routine.tools) && routine.tools.length) {
+      button.title = routine.tools.map(prettify).join(", ");
+    }
+    button.addEventListener("click", () => {
+      if (!send({ type: "routine", name: routine.name })) return;
+      addLine("you", routine.name);
+      app.replyOpen = false;
+    });
+    ui.routines.appendChild(button);
+  });
+}
+
+/* Nothing tells the window what these are set to, so a switch says "I have not
+   asked" until it has been used rather than inventing a state it cannot know. */
+function drawSwitch(button, value) {
+  button.dataset.on = value ? "1" : "0";
+  button.setAttribute("aria-checked", value ? "true" : "false");
+  button.classList.remove("unknown");
+}
+function drawSettings(settings) {
+  if (!settings || typeof settings !== "object") return;
+  if (settings["assistant.brief_mode"] !== undefined) drawSwitch(ui.brief, !!settings["assistant.brief_mode"]);
+  if (settings["ui.always_on_top"] !== undefined) drawSwitch(ui.onTop, !!settings["ui.always_on_top"]);
+  if (settings["tts.speed"] !== undefined) {
+    ui.speed.value = String(settings["tts.speed"]);
+    ui.speedValue.textContent = Number(settings["tts.speed"]).toFixed(2);
+  }
+}
+function flip(button, key) {
+  const next = button.dataset.on !== "1";
+  if (send({ type: "set", key: key, value: next })) drawSwitch(button, next);
+}
+ui.brief.addEventListener("click", () => flip(ui.brief, "assistant.brief_mode"));
+ui.onTop.addEventListener("click", () => flip(ui.onTop, "ui.always_on_top"));
+ui.speed.addEventListener("input", () => { ui.speedValue.textContent = Number(ui.speed.value).toFixed(2); });
+ui.speed.addEventListener("change", () => {
+  send({ type: "set", key: "tts.speed", value: Number(ui.speed.value) });
+});
+
+ui.pause.addEventListener("click", () => {
+  send(app.state === "paused" ? { type: "resume" } : { type: "pause" });
+});
+
+/* Shutting JARVIS down from a window is one click away from a mis-click, so it
+   is two: the button says what the second one will do. */
+ui.quit.addEventListener("click", () => {
+  if (app.quitArmed) {
+    clearTimeout(app.quitArmed);
+    app.quitArmed = null;
+    ui.quit.classList.remove("armed");
+    ui.quit.textContent = "Stand down";
+    send({ type: "quit" });
+    notice("Shutting down, sir.");
+    return;
+  }
+  ui.quit.classList.add("armed");
+  ui.quit.textContent = "Really?";
+  app.quitArmed = setTimeout(() => {
+    app.quitArmed = null;
+    ui.quit.classList.remove("armed");
+    ui.quit.textContent = "Stand down";
+  }, 4000);
+});
+
+/* ------------------------------------------------------------- the confirmation */
+function showConfirm(announcement, seconds) {
+  const span = Math.max(1, Math.round(Number(seconds) || 15));
+  ui.confirmText.textContent = announcement || "Shall I go ahead, sir?";
+  ui.confirmLeft.dataset.count = String(Date.now() / 1000 + span);
+  ui.confirmLeft.textContent = span + " s";
+  ui.confirmYes.disabled = false;
+  ui.confirmNo.disabled = false;
+  ui.confirm.hidden = false;
+  ui.confirmFuse.style.transition = "none";
+  ui.confirmFuse.style.width = "100%";
+  requestAnimationFrame(() => {
+    ui.confirmFuse.style.transition = "width " + span + "s linear";
+    ui.confirmFuse.style.width = "0%";
+  });
+  ui.confirmYes.focus();
+}
+function answerConfirm(granted) {
+  ui.confirmYes.disabled = true;
+  ui.confirmNo.disabled = true;
+  send({ type: "confirm", granted: granted });
+}
+/* The microphone may have answered first; either way the bar goes when the
+   assistant says the question is closed, and never on our own say-so. */
+function hideConfirm(granted) {
+  ui.confirm.hidden = true;
+  delete ui.confirmLeft.dataset.count;
+  addLine("sys", granted ? "confirmed" : "stood down");
+}
+ui.confirmYes.addEventListener("click", () => answerConfirm(true));
+ui.confirmNo.addEventListener("click", () => answerConfirm(false));
+
+/* ------------------------------------------------------------------- the log */
+const LEVELS = { DEBUG: "dbg", INFO: "info", WARNING: "warn", ERROR: "err", CRITICAL: "crit" };
+function onLog(message) {
+  const level = String(message.level || "INFO").toUpperCase();
+  const line = node("div", "lg");
+  line.dataset.level = level;
+  line.appendChild(node("span", "lg-l", LEVELS[level] || level.slice(0, 4).toLowerCase()));
+  line.appendChild(node("span", "lg-n", message.name || ""));
+  line.appendChild(node("span", "lg-t", message.text || ""));
+  ui.logLines.appendChild(line);
+  while (ui.logLines.children.length > MAX_LOG) ui.logLines.removeChild(ui.logLines.firstChild);
+  if (!ui.drawer.hidden) ui.drawer.scrollTop = ui.drawer.scrollHeight;
+  if (level === "WARNING" || level === "ERROR" || level === "CRITICAL") {
+    app.problems += 1;
+    drawDrawerLabel();
+  }
+}
+function drawDrawerLabel() {
+  ui.drawerToggle.textContent = "";
+  ui.drawerToggle.appendChild(document.createTextNode(ui.drawer.hidden ? "log " : "hide log "));
+  if (app.problems) ui.drawerToggle.appendChild(node("span", "badge", app.problems));
+}
+ui.drawerToggle.addEventListener("click", () => {
+  ui.drawer.hidden = !ui.drawer.hidden;
+  ui.drawerToggle.setAttribute("aria-expanded", ui.drawer.hidden ? "false" : "true");
+  if (!ui.drawer.hidden) {
+    app.problems = 0;
+    ui.drawer.scrollTop = ui.drawer.scrollHeight;
+  }
+  drawDrawerLabel();
+});
+ui.onlyProblems.addEventListener("click", () => {
+  const on = ui.onlyProblems.dataset.on !== "1";
+  ui.onlyProblems.dataset.on = on ? "1" : "0";
+  ui.drawer.dataset.filter = on ? "1" : "0";
+});
+
+/* --------------------------------------------------------- talking and typing */
+function arm() {
+  if (app.state === "listening") { send({ type: "stop" }); return; }
+  if (send({ type: "listen" })) notice("");
+}
+ui.talk.addEventListener("click", arm);
+ui.halt.addEventListener("click", () => send({ type: "stop" }));
+
+function submitComposer() {
+  const text = ui.text.value.trim();
+  if (!text) return;
+  ui.text.value = "";
+  if (!send({ type: "say", text: text })) return;
+  addLine("you", text);
+  app.replyOpen = false;
+  notice("");
+}
+ui.composer.addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitComposer();
+});
+ui.text.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    submitComposer();
+  }
+});
+
+/* Escape belongs to the whole window; everything else belongs to whatever has
+   focus, so a space typed into the composer is a space and not a microphone. */
+document.addEventListener("keydown", (event) => {
+  const target = event.target;
+  const typing = !!target && /^(input|textarea|select)$/i.test(target.tagName || "");
+  if (event.key === "Escape") {
+    send({ type: "stop" });
+    if (typing) target.blur();
+    return;
+  }
+  if (typing) return;
+  if (event.code === "Space" && target === ui.talk) {
+    event.preventDefault();
+    arm();
+  }
+});
+
+/* ------------------------------------------------------------ the title bar */
+ui.min.addEventListener("click", () => send({ type: "window", action: "minimize" }));
+ui.close.addEventListener("click", () => {
+  if (!send({ type: "window", action: "close" })) {
+    try { window.close(); } catch (err) { /* a browser tab we may not close */ }
+  }
+});
+
+/* Every countdown on screen - the cards, the timer list, the confirmation fuse -
+   ticks from this one interval rather than one timer each. */
+setInterval(() => {
+  document.querySelectorAll("[data-due]").forEach((element) => {
+    if (element.dataset.due) element.textContent = countdown(element.dataset.due);
+  });
+  const until = ui.confirmLeft.dataset.count;
+  if (until) {
+    ui.confirmLeft.textContent = Math.max(0, Math.round(Number(until) - Date.now() / 1000)) + " s";
+  }
+}, 1000);
+
+/* ---------------------------------------------------------------------- boot */
+setState("idle");
+drawWork();
+drawDrawerLabel();
+/* Opened from a file rather than served, there is nothing to connect to; the page
+   still draws, which is what makes it possible to look at one without a JARVIS. */
+if (location.protocol === "http:" || location.protocol === "https:") connect();
+else setLink(false, "offline");
+</script>
+</body>
+</html>

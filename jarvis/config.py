@@ -99,6 +99,12 @@ DEFAULTS: Final[dict[str, Any]] = {
     "ui": {
         "overlay": True,
         "tray": True,
+        "window": True,
+        "window_mode": "auto",  # auto | webview | edge | browser | off
+        "window_size": [980, 720],
+        "window_pos": None,  # [x, y]
+        "window_on_top": False,
+        "open_window_on_start": True,
         "ring_size": 180,
         "opacity": 0.92,
         "always_on_top": True,

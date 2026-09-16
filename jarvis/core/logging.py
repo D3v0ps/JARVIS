@@ -5,7 +5,8 @@ The whole assistant logs through a single ``jarvis`` logger tree:
 * a ``RotatingFileHandler`` (UTF-8, path/size/backups taken from ``config.yaml``) so the
   Swedish characters JARVIS speaks (å, ä, ö) survive in ``logs/jarvis.log``;
 * a colored console handler that never crashes on a terminal which cannot encode a
-  character (it falls back to ``errors="replace"``).
+  character (it falls back to ``errors="replace"``), and which is left out entirely
+  when the process has no console — under ``pythonw.exe`` the file is the only record.
 
 The structured helpers (:func:`log_transcript`, :func:`log_tool_call`, :func:`log_refusal`,
 :func:`log_latency`) work even when :func:`setup_logging` was never called and never raise
@@ -188,8 +189,17 @@ def _enable_windows_ansi() -> bool:
 
 
 def _console_stream() -> Any:
-    """stdout, reconfigured to replace characters it cannot encode."""
-    stream = sys.stdout or sys.stderr
+    """stdout, reconfigured to replace characters it cannot encode — or ``None``.
+
+    Started from ``pythonw.exe`` a process has no standard streams at all: both
+    ``sys.stdout`` and ``sys.stderr`` are ``None``. ``print()`` quietly does nothing in
+    that case, but a ``StreamHandler`` wrapped around ``None`` raises on every single
+    record, which would turn a silent start into a storm of handler errors. Returning
+    ``None`` lets the callers leave the console handler out altogether.
+    """
+    stream = sys.stdout if sys.stdout is not None else sys.stderr
+    if stream is None or not callable(getattr(stream, "write", None)):
+        return None
     reconfigure = getattr(stream, "reconfigure", None)
     if callable(reconfigure):
         try:
@@ -200,7 +210,7 @@ def _console_stream() -> Any:
 
 
 def _use_color(cfg: "Config | Mapping[str, Any] | None", stream: Any) -> bool:
-    if not bool(_cfg_get(cfg, "logging.color", True)):
+    if stream is None or not bool(_cfg_get(cfg, "logging.color", True)):
         return False
     try:
         if not stream.isatty():
@@ -230,8 +240,15 @@ def _fallback_console_handler() -> None:
         if getattr(logger, _CONFIGURED_FLAG, False) or logger.handlers:
             return
         stream = _console_stream()
-        handler = _SafeStreamHandler(stream)
-        handler.setFormatter(_ColorFormatter(CONSOLE_FORMAT, CONSOLE_DATEFMT, use_color=_use_color(None, stream)))
+        if stream is None:
+            # No console to bootstrap onto (pythonw). A NullHandler keeps this path
+            # from running again on every event and is dropped by setup_logging.
+            handler: logging.Handler = logging.NullHandler()
+        else:
+            handler = _SafeStreamHandler(stream)
+            handler.setFormatter(
+                _ColorFormatter(CONSOLE_FORMAT, CONSOLE_DATEFMT, use_color=_use_color(None, stream))
+            )
         handler.setLevel(logging.INFO)
         setattr(handler, _FALLBACK_FLAG, True)
         logger.addHandler(handler)
@@ -261,8 +278,9 @@ def setup_logging(cfg: "Config") -> logging.Logger:
 
     Adds a UTF-8 ``RotatingFileHandler`` (``logging.file``/``max_bytes``/``backups``,
     resolved against the project root, directory created when missing) plus a colored
-    console handler. Idempotent: the logger is marked with an attribute, so a second call
-    only refreshes the level instead of duplicating handlers.
+    console handler when there is a console to write to. Idempotent: the logger is marked
+    with an attribute, so a second call only refreshes the level instead of duplicating
+    handlers.
     """
     logger = logging.getLogger(LOGGER_NAME)
     level = _coerce_level(_cfg_get(cfg, "logging.level", DEFAULT_LEVEL))
@@ -284,12 +302,14 @@ def setup_logging(cfg: "Config") -> logging.Logger:
         logger.setLevel(level)
         logger.propagate = False
 
-        # Console handler first, so file problems can still be reported.
+        # Console handler first, so file problems can still be reported. Under
+        # pythonw there is no console at all and the file is the whole record.
         stream = _console_stream()
-        console = _SafeStreamHandler(stream)
-        console.setFormatter(_ColorFormatter(CONSOLE_FORMAT, CONSOLE_DATEFMT, use_color=_use_color(cfg, stream)))
-        console.setLevel(level)
-        logger.addHandler(console)
+        if stream is not None:
+            console = _SafeStreamHandler(stream)
+            console.setFormatter(_ColorFormatter(CONSOLE_FORMAT, CONSOLE_DATEFMT, use_color=_use_color(cfg, stream)))
+            console.setLevel(level)
+            logger.addHandler(console)
 
         raw_path = str(_cfg_get(cfg, "logging.file", DEFAULT_LOG_FILE))
         log_path = Path(raw_path).expanduser()
@@ -318,6 +338,9 @@ def setup_logging(cfg: "Config") -> logging.Logger:
             logger.error("Could not open log file %s: %s — console logging only", log_path, exc, exc_info=True)
 
         setattr(logger, _CONFIGURED_FLAG, True)
+        if stream is None:
+            # Said after the file handler exists, so there is somewhere to say it.
+            logger.debug("No console stream available; the log file is the only record")
         logger.debug("Logging configured (level=%s, file=%s)", logging.getLevelName(level), log_path)
         return logger
 

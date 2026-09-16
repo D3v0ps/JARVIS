@@ -74,6 +74,12 @@ tts:
 ui:
   overlay: true
   tray: true
+  window: true              # the desk app window: JARVIS as an app, not a console
+  window_mode: auto         # auto | webview | edge | browser | off — auto takes the best host here
+  window_size: [980, 720]   # remembered when you resize it
+  window_pos: null          # [x, y] — remembered when you move it
+  window_on_top: false      # the ring floats above everything; the window need not
+  open_window_on_start: true  # false starts with the ring only; the tray opens the window
   ring_size: 180
   opacity: 0.92
   always_on_top: true

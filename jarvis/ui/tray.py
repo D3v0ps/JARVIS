@@ -68,7 +68,7 @@ def make_icon_image(color: str, size: int = ICON_SIZE) -> Any:
 
 
 class Tray:
-    """pystray icon with Pause/Resume and Quit. Runs in its own thread."""
+    """pystray icon with Open, Pause/Resume and Quit. Runs in its own thread."""
 
     def __init__(
         self,
@@ -76,11 +76,15 @@ class Tray:
         *,
         on_quit: Callable[[], None] | None = None,
         on_toggle_pause: Callable[[], None] | None = None,
+        on_show_window: Callable[[], None] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._state = state
         self._on_quit = on_quit
         self._on_toggle_pause = on_toggle_pause
+        #: Optional: without a desk window there is nothing to open, and the menu
+        #: should not offer it.
+        self._on_show_window = on_show_window
         self._log = logger or _logger
         self._icon: Any = None
         self._thread: threading.Thread | None = None
@@ -157,15 +161,25 @@ class Tray:
 
     # --- menu -------------------------------------------------------------------
     def _build_menu(self, pystray: Any) -> Any:
-        """Pause/Resume (checked while paused) and Quit."""
-        return pystray.Menu(
+        """Open the console (when there is one), Pause/Resume, and Quit.
+
+        The window is the default item as well as the first, so a double-click on the
+        icon does the thing anyone who has just minimised JARVIS wants.
+        """
+        items = []
+        if self._on_show_window is not None:
+            items.append(
+                pystray.MenuItem("Open the console", self._show_window, default=True)
+            )
+        items.append(
             pystray.MenuItem(
                 lambda _item: "Resume" if self._paused() else "Pause",
                 self._toggle_pause,
                 checked=lambda _item: self._paused(),
-            ),
-            pystray.MenuItem("Quit", self._quit),
+            )
         )
+        items.append(pystray.MenuItem("Quit", self._quit))
+        return pystray.Menu(*items)
 
     def _paused(self) -> bool:
         """Whether the assistant is currently paused, for the menu's label and checkmark."""
@@ -173,6 +187,10 @@ class Tray:
             return self._state.state is AssistantState.PAUSED
         except Exception:  # pragma: no cover - the bus is in-process and cannot fail
             return False
+
+    def _show_window(self, _icon: Any = None, _item: Any = None) -> None:
+        """Menu item: bring the desk window back, or open it for the first time."""
+        self._invoke(self._on_show_window, "show window")
 
     def _toggle_pause(self, _icon: Any = None, _item: Any = None) -> None:
         """Menu item: hand the pause/resume decision to the assistant."""

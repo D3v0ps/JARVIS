@@ -14,6 +14,7 @@ barge-in possible: the ear is still listening while the mouth is moving.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -33,6 +34,25 @@ __all__ = ["Assistant"]
 
 CHIME_RATE = 24000
 FRAME_TIMEOUT = 0.5
+
+#: The fan has no assistant to borrow a logger from, and its failures are debug noise.
+_fan_log = get_logger("desk.fan")
+
+#: The only keys a face may write. The desk server validates the shape of a value;
+#: this decides whether the key may be touched at all, so a second face - or a bug in
+#: the first - still cannot reach brain.model from a web page.
+DESK_SETTINGS: frozenset[str] = frozenset({
+    "tts.speed",
+    "audio.chime_volume",
+    "assistant.brief_mode",
+    "wake.sensitivity",
+    "ui.always_on_top",
+})
+
+#: A button press has no words, and the confirmation path downstream reads words.
+#: These two are what a click is written down as, and both survive ``is_confirmation``.
+CONFIRM_WORD = "confirm"
+CANCEL_WORD = "cancel"
 
 
 class _Mode(Enum):
@@ -61,6 +81,9 @@ class Assistant:
 
         self._confirm_reply: str | None = None
         self._confirm_ready = threading.Event()
+        # The spoken answer and the window's button race for the same slot; the lock
+        # is what makes "first one wins" true rather than nearly true.
+        self._confirm_lock = threading.Lock()
         self._barge_frames = 0
 
         self.conversation_timeout = float(cfg.get("assistant.conversation_timeout", 20) or 20)
@@ -85,7 +108,12 @@ class Assistant:
         self.remote: Any = None
         self.overlay: Any = None
         self.tray: Any = None
+        self.desk: Any = None
+        self.window: Any = None
         self._hud: Any = None
+        self._desk_bus: Any = None
+        self._desk_log_handler: logging.Handler | None = None
+        self._desk_unsubscribe: Callable[[], None] | None = None
 
     def _build_reflex(self) -> Any:
         """The grammar that answers plain commands without waking the model."""
@@ -135,9 +163,11 @@ class Assistant:
         if not self.text_mode:
             self.overlay, self.tray = wiring.build_face(
                 self.cfg, self.state,
-                on_quit=self.stop, on_toggle_pause=self.toggle_pause, logger=self.log,
+                on_quit=self.stop, on_toggle_pause=self.toggle_pause,
+                on_show_window=self.show_window, logger=self.log,
             )
-            self._hud = getattr(self.overlay, "hud", None)
+            self.desk, self.window = wiring.build_desk(self.cfg, self, self.log)
+            self._hud = self._build_hud(getattr(self.overlay, "hud", None))
             self.parts.dispatcher = _HudDispatcher(self.parts.dispatcher, self._hud)
             self.parts.brain.dispatcher = self.parts.dispatcher
 
@@ -161,14 +191,46 @@ class Assistant:
             self._worker.start()
 
     def run_forever(self) -> None:
-        """Block until stopped. The overlay may need the main thread; this honours that."""
-        if self.overlay is not None and getattr(self.overlay, "needs_main_thread", True):
-            run = getattr(self.overlay, "run", None)
-            if callable(run):
-                run()
+        """Block until stopped, giving the main thread to whichever face must have it.
+
+        Only one of them can: pywebview's loop and tkinter's both insist on thread
+        one. The window wins that argument - it is the application, the ring is an
+        ornament - and on Windows the argument does not happen at all, because the
+        layered overlay runs its own message pump on a thread of its own.
+        """
+        window, overlay = self.window, self.overlay
+        if window is not None and getattr(window, "needs_main_thread", False):
+            if overlay is not None and getattr(overlay, "needs_main_thread", True):
+                self.log.info(
+                    "The desk window needs the main thread, so the fallback ring "
+                    "stands down for this session, sir."
+                )
+                self._drop_overlay()
+            if self._run_on_main(window):
+                return
+        elif overlay is not None and getattr(overlay, "needs_main_thread", True):
+            if self._run_on_main(overlay):
                 return
         while self._running.is_set():
             time.sleep(0.2)
+
+    def _run_on_main(self, face: Any) -> bool:
+        """Hand the main thread to ``face``. False when it has nothing to block in."""
+        run = getattr(face, "run", None)
+        if not callable(run):
+            return False
+        run()
+        return True
+
+    def _drop_overlay(self) -> None:
+        """Let the ring go: it cannot have the thread the window is about to take."""
+        overlay, self.overlay = self.overlay, None
+        if overlay is None:
+            return
+        try:
+            overlay.stop()
+        except Exception as exc:  # noqa: BLE001 - it was on its way out anyway
+            self.log.debug("The overlay did not stop cleanly: %s", exc)
 
     def run_in_thread(self) -> threading.Thread:
         thread = threading.Thread(target=self.run_forever, name="jarvis-main", daemon=True)
@@ -182,11 +244,13 @@ class Assistant:
         self._running.clear()
         self._stop_turn.set()
         self._work.put(None)
+        self._unwire_desk()
         for component, method in (
             (self.remote, "stop"), (self.ducker, "stop"),
             (self.parts.speaker, "stop"), (self.parts.speaker, "close"),
             (self.parts.player, "close"), (self.parts.mic, "stop"),
             (self.parts.scheduler, "stop"), (self.parts.client, "close"),
+            (self.window, "stop"), (self.desk, "stop"),
             (self.overlay, "stop"), (self.tray, "stop"),
         ):
             if component is None:
@@ -557,6 +621,237 @@ class Assistant:
         if self._hud is not None:
             self._hud.add_reply(sentence)
 
+    # --- the window ---------------------------------------------------------------------
+    def submit_desk_turn(self, text: str) -> bool:
+        """One typed turn from the window: full rights, spoken out of these speakers.
+
+        It travels as a :class:`~jarvis.remote.session.RemoteTurn` because that is
+        already how anything which is not the microphone gets a turn - but with no
+        ``wrap_dispatcher``, which is precisely what "the desk" means. The window sits
+        at the keyboard, and the keyboard was never the phone. False means busy.
+        """
+        said = " ".join(str(text or "").split())
+        if not said:
+            self.log.warning("The window sent an empty turn.")
+            return False
+        try:
+            from jarvis.remote.session import RemoteTurn
+        except Exception as exc:  # noqa: BLE001 - no remote package, no typed turn
+            self.log.error("A desk turn needs jarvis.remote.session: %s", exc)
+            return False
+
+        def speak(sentence: str) -> None:
+            # A remote turn is spoken here only when remote.speak_locally says so; a
+            # desk turn is always spoken here, and must be spoken exactly once.
+            if not self.cfg.get("remote.speak_locally", False):
+                self.parts.speaker.enqueue(sentence)
+
+        def done(reply: str, error: str) -> None:
+            if error:
+                self._say_in_character(error)
+            self.log.info("Desk turn complete: %s", (error or reply or "")[:80])
+
+        turn = RemoteTurn(
+            audio=None,
+            text=said,
+            device="the desk",
+            on_sentence=speak,
+            on_done=done,
+            speak_locally=True,
+        )
+        self.log.info("Desk turn (typed): %r", said[:80])
+        return self.submit_remote_turn(turn)
+
+    def arm_listening(self) -> bool:
+        """Open the microphone as though the wake word had fired. False when he cannot.
+
+        The same call the ear makes, rather than a second copy of it: the chime, the
+        acknowledgement and the follow-up window all belong to waking up, and a button
+        that only did some of that would be a different thing wearing the same name.
+        """
+        if self.text_mode:
+            return False
+        if self._paused.is_set():
+            self.log.info("The window asked me to listen, but I am paused, sir.")
+            return False
+        if self._mode is not _Mode.IDLE:
+            self.log.info("The window asked me to listen while %s.", self._mode.value)
+            return False
+        self.log.info("The window armed the microphone.")
+        self._on_wake()
+        return True
+
+    def abort_turn(self) -> None:
+        """Stop talking and abandon the turn - the button that barge-in gives you by voice."""
+        try:
+            self.parts.speaker.stop()
+        except Exception as exc:  # noqa: BLE001 - a dead speaker is not a failed stop
+            self.log.debug("The speaker would not stop: %s", exc)
+        self._stop_turn.set()
+        self.log.info("The turn was stopped from the window.")
+
+    def answer_confirmation(self, granted: bool) -> bool:
+        """Answer a waiting GUARDED tool with a click. False when nothing is waiting."""
+        if self._mode is not _Mode.CONFIRMING:
+            self.log.info("The window answered a confirmation nobody was waiting for.")
+            return False
+        word = CONFIRM_WORD if granted else CANCEL_WORD
+        if not self._settle_confirmation(word, source="the window"):
+            return False
+        self.log.info("The window %s the confirmation.", "granted" if granted else "refused")
+        return True
+
+    def run_routine(self, name: str) -> str:
+        """Run a named macro from ``remote.routines``; returns the line it came back with.
+
+        The phone's runner already finds the macro, walks its calls and composes that
+        line. The only thing that differs at the desk is the rights, so the loop is
+        borrowed and the tier guard dropped rather than the whole of it written twice.
+        """
+        wanted = " ".join(str(name or "").split())
+        if not wanted:
+            return ""
+        try:
+            from jarvis.remote.server import RemoteServer
+
+            class _DeskRoutines(RemoteServer):
+                """The phone's macro runner with the desk's rights: no tier guard."""
+
+                def guard_for(self, device: Any) -> Callable[[Any], Any]:
+                    return lambda inner: inner
+
+            ok, said = _DeskRoutines(self.cfg, self, self.log).run_routine(wanted, "the desk")
+        except Exception as exc:  # noqa: BLE001 - a macro is never worth the session
+            self.log.exception("The routine %r failed: %s", wanted, exc)
+            return ""
+        if said:
+            self._say_in_character(said)
+        self.log.info("Routine %r finished %s.", wanted, "well" if ok else "badly")
+        return said
+
+    def apply_setting(self, key: str, value: Any) -> bool:
+        """Change one allowlisted key, write it to config.yaml, and apply it now if cheap."""
+        name = str(key or "").strip()
+        if name not in DESK_SETTINGS:
+            self.log.warning("Refusing to set %r from a face: it is not on the list.", name)
+            return False
+        try:
+            self.cfg.set(name, value)
+            self.cfg.save()
+        except Exception as exc:  # noqa: BLE001 - a read-only config file is not a crash
+            self.log.warning("Could not save %s: %s", name, exc)
+            return False
+        self._apply_setting_now(name, value)
+        self.log.info("%s is now %r.", name, value)
+        return True
+
+    def show_window(self) -> None:
+        """The tray's way back to the window: raise it, or open it for the first time."""
+        window = self.window
+        if window is None:
+            self.log.info("There is no desk window this session, sir.")
+            return
+        try:
+            if not window.show():
+                window.start()
+        except Exception as exc:  # noqa: BLE001 - the tray thread must outlive this
+            self.log.warning("The desk window would not open: %s", exc)
+
+    def _apply_setting_now(self, key: str, value: Any) -> None:
+        """Make a saved setting true for this session wherever that costs nothing.
+
+        ``assistant.brief_mode`` is read from the config every time it matters and so
+        needs nothing here; ``ui.always_on_top`` is decided when the overlay is built
+        and honestly waits for the next start.
+        """
+        try:
+            if key == "tts.speed":
+                self._set_speed(float(value))
+            elif key == "audio.chime_volume":
+                self.parts.speaker.chime_volume = float(value)
+            elif key == "wake.sensitivity" and self.parts.wake is not None:
+                self.parts.wake.sensitivity = float(value)
+        except Exception as exc:  # noqa: BLE001 - it is saved; this session can miss out
+            self.log.debug("%s could not be applied to this session: %s", key, exc)
+
+    def _set_speed(self, speed: float) -> None:
+        """Retune the voice mid-session, by a setter if the Speaker ever grows one.
+
+        It keeps its engines to itself and has no such setter today, so until it does
+        this reaches for the engines it can see rather than making the operator
+        restart JARVIS to hear a slider move.
+        """
+        speaker = self.parts.speaker
+        setter = getattr(speaker, "set_speed", None)
+        if callable(setter):
+            setter(speed)
+            return
+        cached = getattr(speaker, "_engines", None)
+        engines = [getattr(speaker, "_engine", None)]
+        engines += list(cached.values()) if isinstance(cached, dict) else []
+        for engine in engines:
+            if engine is not None and hasattr(engine, "speed"):
+                engine.speed = speed
+
+    def _build_hud(self, hud: Any) -> Any:
+        """What the fifteen narration call sites write to for the rest of the session.
+
+        With no window that is the overlay's own model, exactly as before. With one it
+        is the fan, so neither the overlay nor the loop ever learns that a second face
+        is listening.
+        """
+        bus = getattr(self.desk, "bus", None)
+        if bus is None:
+            return hud
+        self._desk_bus = bus
+        self._wire_desk_bus(bus)
+        return _HudFan(hud, bus, marks=self.parts.latency.marks)
+
+    def _wire_desk_bus(self, bus: Any) -> None:
+        """The two streams the narration does not carry: the state, and the log tail."""
+        try:
+            self._desk_unsubscribe = self.state.subscribe(
+                lambda state: bus.publish("state", state=str(state))
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("The window cannot follow the state: %s", exc)
+        try:
+            from jarvis.desk.bus import DeskLogHandler
+
+            handler = DeskLogHandler(bus)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logging.getLogger("jarvis").addHandler(handler)
+            self._desk_log_handler = handler
+        except Exception as exc:  # noqa: BLE001 - a drawer with nothing in it will do
+            self.log.debug("The window's log drawer is unavailable: %s", exc)
+
+    def _unwire_desk(self) -> None:
+        """Detach from the log and the state bus before the window's bus is closed."""
+        handler, self._desk_log_handler = self._desk_log_handler, None
+        if handler is not None:
+            try:
+                logging.getLogger("jarvis").removeHandler(handler)
+                handler.close()
+            except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+                self.log.debug("The log handler would not detach: %s", exc)
+        unsubscribe, self._desk_unsubscribe = self._desk_unsubscribe, None
+        if unsubscribe is not None:
+            try:
+                unsubscribe()
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("The state bus had already let the window go: %s", exc)
+        self._desk_bus = None
+
+    def _desk_publish(self, kind: str, **payload: Any) -> None:
+        """Tell the window something the HUD interface has no word for."""
+        bus = self._desk_bus
+        if bus is None:
+            return
+        try:
+            bus.publish(kind, **payload)
+        except Exception as exc:  # noqa: BLE001 - the window is never worth a turn
+            self.log.debug("Publishing %s to the window failed: %s", kind, exc)
+
     # --- guarded confirmation ----------------------------------------------------------
     def _tool_confirm(self, announcement: str) -> bool:
         """Say what is about to happen, then wait to be told to go ahead."""
@@ -575,6 +870,11 @@ class Assistant:
         self.parts.segmenter.reset()
         self._mode = _Mode.CONFIRMING
         self.state.set(AssistantState.LISTENING)
+        # Published only once the mode is set, so the bar the window draws and the
+        # button on it become live at the same moment.
+        self._desk_publish(
+            "confirm", announcement=announcement, seconds=self.confirmation_timeout
+        )
 
         # A tone every two seconds, so the window you have to answer in is audible
         # as well as visible. Five repeats cover the ten seconds exactly.
@@ -600,6 +900,7 @@ class Assistant:
         waiting.set()
         self._mode = _Mode.WORKING
         self.state.set(AssistantState.THINKING)
+        self._desk_publish("confirm_done", granted=granted)
         if self._hud is not None:
             self._hud.note = "" if granted else "cancelled"
             self._hud.touch()
@@ -618,12 +919,26 @@ class Assistant:
         """Transcribed on the ear's thread: the mind is busy waiting for this answer."""
         try:
             transcript = self.parts.transcriber.transcribe(utterance, self.sample_rate)
-            self._confirm_reply = (transcript.text or "").strip()
+            reply = (transcript.text or "").strip()
         except Exception as exc:  # noqa: BLE001
             self.log.warning("Could not transcribe the confirmation: %s", exc)
-            self._confirm_reply = ""
-        finally:
+            reply = ""
+        self._settle_confirmation(reply, source="the microphone")
+
+    def _settle_confirmation(self, reply: str, *, source: str) -> bool:
+        """Write down the first answer to arrive. False means somebody else was first.
+
+        The spoken word and the window's button are two threads racing for one slot,
+        and a race that both win would run a guarded tool on the strength of an answer
+        the operator had already changed his mind about.
+        """
+        with self._confirm_lock:
+            if self._confirm_ready.is_set():
+                self.log.debug("A confirmation from %s arrived second; ignored.", source)
+                return False
+            self._confirm_reply = reply
             self._confirm_ready.set()
+        return True
 
     # --- speaking ----------------------------------------------------------------------
     def _tool_speak(self, text: str) -> None:
@@ -696,6 +1011,127 @@ class Assistant:
         log_transcript("user", text)
         result = self.parts.brain.turn(text, on_sentence=collect, should_stop=lambda: False)
         return " ".join(said).strip() or result.reply
+
+
+class _HudFan:
+    """Looks exactly like HudModel; writes to the overlay and to the DeskBus.
+
+    The loop narrates itself at fifteen call sites, and the window wants every one of
+    them. A second call beside each would be fifteen chances to add one and forget
+    the other, so this satisfies the same interface and the loop goes on talking to a
+    single object. Either half may be missing - no overlay, no window, or neither -
+    and nothing here raises back into the turn that was only trying to say what it
+    was doing.
+    """
+
+    def __init__(
+        self,
+        hud: Any = None,
+        bus: Any = None,
+        *,
+        marks: Callable[[], dict] | None = None,
+    ) -> None:
+        self._hud = hud
+        self._bus = bus
+        #: Reads the latency tracker's marks, so the window gets the breakdown and not
+        #: just the total. Optional: the overlay only ever needed the total.
+        self._marks = marks
+        self._note = ""
+        self._latency_ms: float | None = None
+        self._state: AssistantState = AssistantState.IDLE
+
+    # --- the attributes the loop assigns to -------------------------------------------
+    @property
+    def state(self) -> AssistantState:
+        return self._state
+
+    @state.setter
+    def state(self, value: AssistantState) -> None:
+        # Not published: the window hears about states from StateBus, and two sources
+        # for one fact is how they start disagreeing.
+        self._state = value
+        if self._hud is not None:
+            self._hud.state = value
+
+    @property
+    def note(self) -> str:
+        return self._note
+
+    @note.setter
+    def note(self, value: str) -> None:
+        self._note = value
+        if self._hud is not None:
+            self._hud.note = value
+        self._publish("note", text=str(value or ""))
+
+    @property
+    def latency_ms(self) -> float | None:
+        return self._latency_ms
+
+    @latency_ms.setter
+    def latency_ms(self, value: float | None) -> None:
+        self._latency_ms = value
+        if self._hud is not None:
+            self._hud.latency_ms = value
+        if value is None:
+            return
+        marks: dict = {}
+        if self._marks is not None:
+            try:
+                marks = dict(self._marks() or {})
+            except Exception:  # noqa: BLE001 - a missing breakdown is not a failure
+                marks = {}
+        self._publish("latency", ms=float(value), marks=marks)
+
+    # --- the methods the loop calls ----------------------------------------------------
+    def begin_turn(self, heard: str) -> None:
+        self._note = ""
+        self._latency_ms = None
+        if self._hud is not None:
+            self._hud.begin_turn(heard)
+        self._publish("heard", text=str(heard or ""))
+
+    def add_reply(self, sentence: str) -> None:
+        if self._hud is not None:
+            self._hud.add_reply(sentence)
+        self._publish("sentence", text=str(sentence or ""))
+
+    def tool_started(self, name: str) -> Any:
+        """Start a tool. Returns the overlay's own ToolEvent, or None when it has none."""
+        event = self._hud.tool_started(name) if self._hud is not None else None
+        self._publish("tool", name=str(name), phase="start")
+        return event
+
+    def tool_finished(
+        self, name: str, *, ok: bool, duration_ms: float, refused: bool = False
+    ) -> None:
+        if self._hud is not None:
+            self._hud.tool_finished(name, ok=ok, duration_ms=duration_ms, refused=refused)
+        self._publish(
+            "tool", name=str(name), phase="end", ok=bool(ok), refused=bool(refused),
+            ms=float(duration_ms),
+        )
+
+    def touch(self) -> None:
+        if self._hud is not None:
+            self._hud.touch()
+
+    # --- the halves --------------------------------------------------------------------
+    def _publish(self, kind: str, **payload: Any) -> None:
+        bus = self._bus
+        if bus is None:
+            return
+        try:
+            bus.publish(kind, **payload)
+        except Exception:  # noqa: BLE001 - a face is never worth the turn it describes
+            _fan_log.debug("The desk bus refused a %s event.", kind, exc_info=True)
+
+    def __getattr__(self, item: str) -> Any:
+        """Anything else the renderer reads - heard, reply, tools - belongs to the HUD."""
+        hud = self.__dict__.get("_hud")
+        if hud is None:
+            raise AttributeError(item)
+        return getattr(hud, item)
 
 
 class _HudDispatcher:

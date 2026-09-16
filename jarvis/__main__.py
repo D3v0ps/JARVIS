@@ -1,6 +1,7 @@
 """Command line entry point.
 
-    python -m jarvis                      the whole thing: voice, overlay, tray
+    python -m jarvis                      the whole thing: voice, window, ring, tray
+    python -m jarvis --no-window          the ring and the tray, no desk window
     python -m jarvis --no-ui              console only
     python -m jarvis --text               type instead of talk, same brain and tools
     python -m jarvis --say "Good evening" speak one line and exit
@@ -16,7 +17,12 @@ half-installed - which is exactly when you need it most.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from typing import Any
+
+#: Kept alive for the life of the process: a closed sink is worse than no sink.
+_SINKS: list[Any] = []
 
 BANNER = r"""
    _____ ___    ____  _    __ ___ _____
@@ -27,13 +33,38 @@ BANNER = r"""
 """
 
 
+def _install_null_streams() -> bool:
+    """Give the process somewhere to write when Windows gave it nowhere.
+
+    Started from ``pythonw.exe`` there is no console: ``sys.stdout`` and ``sys.stderr``
+    are ``None``. ``print()`` copes with that by doing nothing, but a ``StreamHandler``
+    over ``None`` raises on every record, and so does any library that assumes a
+    stream exists. Two handles on the null device cost nothing and make the question
+    go away before the first import that might ask it.
+
+    Returns whether there was a console to print a banner to.
+    """
+    console = sys.stdout is not None
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            sink = open(os.devnull, "w", encoding="utf-8")
+            _SINKS.append(sink)
+            setattr(sys, name, sink)
+    return console
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m jarvis",
         description="J.A.R.V.I.S. - a fully local voice assistant.",
     )
     parser.add_argument("--config", default=None, metavar="PATH", help="path to config.yaml")
-    parser.add_argument("--no-ui", action="store_true", help="no overlay and no tray icon")
+    parser.add_argument("--no-ui", action="store_true",
+                        help="no window, no overlay and no tray icon")
+    parser.add_argument("--window", dest="window", action="store_true", default=None,
+                        help="open the desk window, whatever config.yaml says")
+    parser.add_argument("--no-window", dest="window", action="store_false",
+                        help="no desk window; the ring and the tray remain")
     parser.add_argument("--text", action="store_true", help="terminal chat instead of voice")
     parser.add_argument("--say", metavar="TEXT", default=None, help="speak one line and exit")
     parser.add_argument("--list-devices", action="store_true", help="list audio devices and exit")
@@ -50,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    console = _install_null_streams()
     parser = _parser()
     try:
         args = parser.parse_args(argv)
@@ -112,11 +144,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.say is not None:
         return _say_once(cfg, args.say, logger)
 
+    if args.window is not None:
+        cfg.set("ui.window", bool(args.window))
     if args.no_ui:
+        # The blunt instrument, and it stays blunt: everything with a face goes.
         cfg.set("ui.overlay", False)
         cfg.set("ui.tray", False)
+        cfg.set("ui.window", False)
 
-    print(BANNER)
+    if console:
+        print(BANNER)
 
     from jarvis.core.assistant import Assistant
 

@@ -386,40 +386,21 @@ class RemoteServer:
     def status_snapshot(self) -> dict:
         """The desk at a glance: state, load, temperature, what is scheduled.
 
-        Cheap on purpose - the phone polls it every few seconds. nvidia-smi is the
-        slow part, so its answer is cached for a couple of seconds.
+        The reading itself belongs to :mod:`jarvis.core.telemetry`, which caches the
+        slow parts and is shared with the desk window - the two faces must never
+        disagree about the one machine they are both watching. Added here: the phone's
+        own view of the state, and the keys its page expects to exist.
         """
-        snapshot: dict[str, Any] = {"state": self.current_state(), "ok": True}
-        now = time.monotonic()
-        cached = getattr(self, "_status_cache", None)
-        if cached and now - cached[0] < 2.5:
-            return cached[1]
-        try:
-            import psutil  # noqa: PLC0415
+        from jarvis.core.telemetry import snapshot as read_machine  # noqa: PLC0415
 
-            snapshot["cpu"] = round(psutil.cpu_percent(interval=None))
-            snapshot["ram"] = round(psutil.virtual_memory().percent)
-            snapshot["uptime_s"] = int(time.time() - psutil.boot_time())
-        except Exception:  # noqa: BLE001 - psutil is optional
-            pass
         try:
-            from jarvis.tools.system_tools import _gpu_info  # noqa: PLC0415
-
-            gpu = _gpu_info()
-            if gpu:
-                snapshot["gpu"] = {k: round(v) for k, v in gpu.items()}
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            scheduler = getattr(getattr(self.assistant, "parts", None), "scheduler", None)
-            jobs = scheduler.pending() if scheduler is not None else []
-            snapshot["timers"] = [
-                {"id": j.id, "label": j.label or j.text or j.kind, "due": j.due, "kind": j.kind}
-                for j in sorted(jobs, key=lambda j: j.due)[:5]
-            ]
-        except Exception:  # noqa: BLE001
-            snapshot["timers"] = []
-        self._status_cache = (now, snapshot)
+            snapshot: dict[str, Any] = read_machine(self.assistant)
+        except Exception:  # noqa: BLE001 - a glance at the phone must never throw
+            self.log.debug("Telemetry could not be read.", exc_info=True)
+            snapshot = {}
+        snapshot["state"] = self.current_state()
+        snapshot.setdefault("timers", [])
+        snapshot["ok"] = True
         return snapshot
 
     def current_state(self) -> str:
