@@ -1,0 +1,16 @@
+# JARVIS — the nice-to-haves.
+#
+# Everything here is installed in its own step, and the installer only *warns* when
+# it fails: a machine that cannot build one of these still gets a working JARVIS.
+# Never move a line from here into requirements.txt without a very good reason —
+# an aborted install over an optional dependency is the worst failure we can ship.
+
+# --- the desk window ---
+# Edge WebView2 is already part of Windows 11; pywebview is the binding that puts it
+# in a frameless window of our own. Without it the same page opens in Edge's app
+# mode instead, which looks nearly identical, so this is genuinely optional.
+pywebview>=5.0            ; sys_platform == "win32"
+
+# --- the phone ---
+# Enable-Phone.bat prints the address as a QR code to scan.
+qrcode>=7.4

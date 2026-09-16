@@ -41,6 +41,13 @@ if not exist "%VPY%" (
         pause
         exit /b 1
     )
+    REM The desk window and the QR code. A failure here is not fatal: without
+    REM pywebview the same window opens in Edge's app mode instead.
+    if exist "requirements-optional.txt" (
+        echo   [*] Installing the desk window...
+        "%VPY%" -m pip install -r requirements-optional.txt
+        if errorlevel 1 echo   [!] The native window could not be installed; Edge will host it instead.
+    )
     echo   [*] Running preflight checks...
     "%VPY%" -m jarvis --preflight --fix
 )

@@ -40,7 +40,9 @@ pystray>=0.19.5          # tray icon (tkinter ships with Python)
 flask>=3.0
 flask-sock>=0.7
 waitress>=3.0
-qrcode>=7.4              # Enable-Phone.bat draws the address as a QR code to scan
+
+# The desk window and the QR code live in requirements-optional.txt: a machine that
+# cannot install them still gets a working JARVIS, and the installer only warns.
 
 # --- GPU acceleration for faster-whisper (harmless on CPU-only machines) ---
 nvidia-cublas-cu12       ; sys_platform == "win32"

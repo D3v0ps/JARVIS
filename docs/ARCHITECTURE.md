@@ -807,3 +807,248 @@ iOS specifics that must be handled: create and `resume()` the AudioContext insid
 push-to-talk tap handler or output is silent; offer Add to Home Screen; AudioWorklet is
 fine from iOS 14.1. Always-on wake word in the browser is not attempted - iOS suspends
 the tab and it drains the battery. Push-to-talk is the design, not a compromise.
+
+---
+
+## 24. `jarvis/desk/` — the app on the desk
+
+Everything up to here gave the desk a *ring*. The window behind the ring was still a
+console: the banner, the log lines, the pairing code, the tracebacks. That is a
+terminal with a nice ornament floating over it, and a terminal is not an app.
+
+This section is the app: **one window, drawn as a web page, hosted natively, with no
+console anywhere.** The page is the same design language as the phone - the same
+reactor geometry, the same cards, the same palette - because the phone and the desk
+should be the same product seen from two places.
+
+```
+jarvis/desk/__init__.py          lazy exports, like jarvis/ui
+jarvis/desk/bus.py               DeskBus - the event fan-out and its replay buffer
+jarvis/desk/server.py            DeskServer - loopback Flask + flask-sock
+jarvis/desk/window.py            DeskWindow - the native host and its fallbacks
+jarvis/desk/static/desk.html     the app itself, one file, no build step
+jarvis/core/telemetry.py         snapshot() - one reading of the machine
+```
+
+### 24.1 Why a web page in a native window
+
+tkinter cannot draw this: no anti-aliasing, no blur, no transitions, no flexbox, and a
+`Text` widget that looks like 1996. The arc reactor already had to leave tkinter for a
+per-pixel-alpha bitmap (§ on `layered.py`); a whole application window would have to
+leave it too, and re-implementing card layout, scrolling and countdown animation over a
+Pillow blitter is a month of work to land somewhere worse than a stylesheet.
+
+**Edge WebView2 is already on every Windows 11 machine.** `pywebview` binds to it in a
+few hundred kilobytes and gives a frameless, resizable, always-on-top-capable window
+that renders the page we have already designed and tested. When it is missing, Edge's
+own app mode (`msedge --app=<url>`) shows the same page in a window with no browser
+chrome. When even that fails, the ring alone remains and JARVIS behaves exactly as he
+does today. Three hosts, one page, and the assistant never depends on any of them.
+
+This is a stated stack addition, not a swap: tkinter keeps the fallback ring, the
+layered overlay keeps the reactor, `pywebview` is optional and lazily imported, and
+`python -m jarvis --no-window` turns the whole section off.
+
+### 24.2 The transport, and why there is a socket at all
+
+`pywebview` can bridge Python and JavaScript directly (`js_api`) with no socket, which
+is tempting for a local app. The Edge fallback cannot: a browser needs a URL. Rather
+than write the page twice, the desk runs **one loopback server** and both hosts point at
+it. It also means the window can be closed and reopened, or opened for the first time an
+hour into a session, and still see the conversation so far.
+
+```python
+class DeskServer:
+    def __init__(self, cfg, assistant, logger) -> None
+    @property
+    def bus(self) -> DeskBus
+    @property
+    def url(self) -> str            # http://127.0.0.1:<port>/?t=<ticket>
+    @property
+    def running(self) -> bool
+    def start(self) -> bool         # False, never an exception, when it cannot
+    def stop(self) -> None
+    def create_app(self) -> Any     # Flask; imported lazily, for the tests
+```
+
+Rules the implementation must keep:
+
+* **Loopback only, ephemeral port.** Bind `127.0.0.1` with port `0` and read back what
+  the OS gave. `0.0.0.0` is refused the way `RemoteServer` refuses it.
+* **A single-use ticket, then a cookie.** The URL carries `?t=<32 urlsafe bytes>`,
+  generated per run and never written to disk. `GET /` exchanges it for a session
+  cookie (`HttpOnly`, `SameSite=Strict`, no `Secure` - this is `http://127.0.0.1`) and
+  **burns it**; a second use is refused. The ticket only exists to survive one command
+  line (Edge's) and one process list, so it expires after 120 s as well.
+* **Every request must come from a loopback peer** and carry `Host: 127.0.0.1:<port>`.
+  A request whose `Origin` is set and is not that host is refused - that is the DNS
+  rebinding defence, and it costs four lines.
+* **Full rights.** This is the desk, not the phone: no `RemoteGuard`, no
+  `remote_tier()`. GUARDED tools take the normal announce-and-confirm path; the window
+  just gives you a Confirm button as well as a microphone. The blocklist is unchanged
+  and applies exactly as it does at the keyboard.
+* The desk server is **independent of `remote.enabled`**. Turning the phone off must
+  not take the desk's window with it, and turning the window off must not close the
+  phone's door.
+
+### 24.3 `DeskBus` - what the window is told
+
+```python
+@dataclass(frozen=True)
+class DeskEvent:
+    type: str
+    payload: dict
+    at: float
+
+class DeskBus:
+    def __init__(self, *, history: int = 200) -> None
+    def publish(self, type: str, /, **payload) -> DeskEvent
+    def subscribe(self) -> "queue.Queue[DeskEvent]"   # its own queue, unbounded-but-capped
+    def unsubscribe(self, q) -> None
+    def replay(self) -> list[DeskEvent]               # the ring buffer, oldest first
+    def close(self) -> None
+```
+
+Thread-safe, never raises into a caller, drops the oldest event for a subscriber that
+has stopped draining rather than growing without limit.
+
+Server to page:
+
+| `type` | payload |
+|---|---|
+| `hello` | `version, model, whisper, gpu, phone_url, paused, routines[], tools[]` |
+| `state` | `state` — idle / listening / thinking / speaking / paused |
+| `heard` | `text` |
+| `sentence` | `text` |
+| `tool` | `name, phase("start"\|"end"), ok, refused, summary, data, ms` |
+| `confirm` | `announcement, seconds` — a GUARDED tool is waiting |
+| `confirm_done` | `granted` |
+| `latency` | `ms, marks{}` |
+| `note` | `text` — a problem the operator should see |
+| `log` | `level, name, text` |
+| `status` | the `telemetry.snapshot()` dict, pushed every 2 s while a window is open |
+
+Page to server (`/ws/desk`, JSON frames):
+
+| `type` | effect |
+|---|---|
+| `say` | one typed turn, full rights, through the same queue as the microphone |
+| `listen` | arm the microphone as if the wake word had fired |
+| `stop` | stop speaking / abandon the turn |
+| `confirm` | `granted: bool` answers a pending GUARDED confirmation |
+| `pause` / `resume` | the same toggle the tray has |
+| `routine` | run a named macro from `remote.routines` |
+| `set` | one key from a small allowlist: `tts.speed`, `audio.chime_volume`, `assistant.brief_mode`, `wake.sensitivity`, `ui.always_on_top` |
+| `quit` | `assistant.stop()` |
+
+Anything else is answered with an `error` frame and logged. No frame may reach `eval`,
+the dispatcher or the config by name that is not on these lists.
+
+The server never reaches into the assistant's internals for any of this. `Assistant`
+grows exactly six methods, each of which returns rather than raises:
+
+```python
+def submit_desk_turn(self, text: str) -> bool     # a typed turn, spoken aloud, full rights
+def arm_listening(self) -> bool                   # as if the wake word had fired
+def abort_turn(self) -> None                      # stop speaking, abandon the turn
+def answer_confirmation(self, granted: bool) -> bool   # resolve a pending GUARDED confirm
+def run_routine(self, name: str) -> str           # a named macro; returns what was said
+def apply_setting(self, key: str, value: Any) -> bool  # one allowlisted config key
+```
+
+### 24.4 Where the events come from
+
+The assistant already narrates itself to the overlay's `HudModel` at fifteen call
+sites (`begin_turn`, `add_reply`, `tool_started`, `tool_finished`, `note`, `touch`,
+`latency_ms`). Rather than add a second set of calls beside every one of them, the desk
+inserts a **fan** that satisfies the same interface and forwards to both:
+
+```python
+class _HudFan:          # jarvis/core/assistant.py, private
+    """Looks exactly like HudModel; writes to the overlay and to the DeskBus."""
+```
+
+`Assistant.start()` builds it when a desk window is up, so `self._hud` keeps working
+whether the overlay exists, the window exists, both or neither. `StateBus` is subscribed
+directly. Log lines arrive through a `logging.Handler` that publishes to the bus at
+`INFO` and above, with a formatter that keeps one line per record.
+
+### 24.5 `DeskWindow` - the host and its three fallbacks
+
+```python
+class DeskWindow:
+    def __init__(self, cfg, url, *, logger, on_close=None) -> None
+    @property
+    def backend(self) -> str          # "webview" | "edge" | "browser" | "none"
+    @property
+    def needs_main_thread(self) -> bool   # True only for "webview"
+    def start(self) -> bool
+    def run(self) -> None             # blocks; the pywebview loop, else returns at once
+    def show(self) -> None
+    def hide(self) -> None
+    def toggle(self) -> None
+    def stop(self) -> None
+```
+
+Order: `pywebview` (frameless, `easy_drag`, remembered size and position, closing hides
+to the tray instead of quitting) → `msedge --app=<url>` with a dedicated
+`--user-data-dir` under `logs/` so it never touches the user's profile → the default
+browser → `none`, which logs one line and leaves the ring to do its job.
+
+**The main thread** belongs to whoever must have it. `LayeredOverlay` already declares
+`needs_main_thread = False` and runs its own message pump, so on Windows the reactor and
+a pywebview window coexist. The tkinter `Overlay` does need it: when the window takes the
+main thread and only the tkinter ring is available, the ring is dropped with one logged
+line - the window is the bigger loss.
+
+### 24.6 What the page shows
+
+The layout is a single column of live evidence, not a chat log:
+
+* a title bar of our own (drag region, minimise, close-to-tray) - no Windows chrome;
+* the reactor, large, in the desk's states, and it is also the push-to-talk button;
+* **the working line**: heard → thinking → each tool as it fires → the answer, with the
+  end-of-speech-to-first-audio latency printed when the turn lands;
+* **cards**, the same renderer the phone uses (`jarvis/ui/web/cards.js`): a business with
+  its number, a timer that counts down, the weather, a refusal in red;
+* **telemetry**: CPU, RAM, GPU load and temperature, VRAM, the model that is resident;
+* **timers and reminders**, counting down, cancellable;
+* **a confirmation bar** that appears for a GUARDED tool with Confirm and Cancel, next to
+  the spoken window - whichever answers first wins;
+* **a composer** for typed turns, and the routine buttons;
+* **a log drawer**, collapsed by default, tailing `logs/jarvis.log` through the bus.
+
+`desk.html` is one self-contained file, like the phone's `index.html`: same reactor
+geometry, same card vocabulary, same palette, no build step and no shared bundle. The
+two pages are deliberately not factored into a common module yet - the phone page ships
+and works, and coupling it to a second consumer to save a few hundred lines would risk
+a face that is already in the user's hand. When a third face appears, extract then.
+
+### 24.7 No console, ever
+
+`JARVIS.exe` is rebuilt for the **GUI subsystem** (`-mwindows`) and starts
+`.venv\Scripts\pythonw.exe -m jarvis` directly with `CREATE_NO_WINDOW` - no `cmd.exe`,
+no `start-jarvis.bat`, no black rectangle at any point. When the process exits non-zero
+it shows a message box with the last lines of `logs\jarvis.log` and a button that opens
+the file. `start-jarvis.bat` stays exactly as it is for anyone who wants the console.
+
+Under `pythonw` there is no `sys.stdout`: `print()` becomes a silent no-op (CPython
+returns early when `sys.stdout is None`), but a `StreamHandler` over `None` raises on
+every record. `setup_logging` therefore **skips the console handler when there is no
+console stream**, and `jarvis/__main__.py` installs a null stream before anything else
+so third-party code cannot trip over it either.
+
+### 24.8 Configuration
+
+```yaml
+ui:
+  window: true            # the desk app window
+  window_mode: auto       # auto | webview | edge | browser | off
+  window_size: [980, 720]
+  window_pos: null        # [x, y], remembered when you move it
+  window_on_top: false
+  open_window_on_start: true
+```
+
+`--window` / `--no-window` override it for one run; `--no-ui` still turns off
+everything with a face.

@@ -488,6 +488,20 @@ if ($code -ne 0) {
 }
 Ok "All dependencies installed"
 
+# The desk window and the QR code. Deliberately a separate step: a machine that cannot
+# build one of these still gets a working JARVIS, so this warns where the step above
+# aborts. Without pywebview the same window opens in Edge's app mode instead.
+$optional = Join-Path $Root "requirements-optional.txt"
+if (Test-Path $optional) {
+    Say "Installing the desk window..."
+    $code = Invoke-Native $VenvPy @("-m", "pip", "install", "-r", $optional) -Passthrough
+    if ($code -ne 0) {
+        Warn "The native window could not be installed; JARVIS will open his console in Edge instead."
+    } else {
+        Ok "The desk window is in place"
+    }
+}
+
 # --------------------------------------------------------------------------- #
 #  7. Voice and wake word models
 # --------------------------------------------------------------------------- #

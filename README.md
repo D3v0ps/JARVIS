@@ -42,6 +42,11 @@ mic → wake word → VAD → Whisper → Ollama (+tools) → Kokoro → speaker
 
 ## 1b. The face
 
+Two of them, and they show the same thing at different sizes: **the window**
+([§2a](#2a-the-app-on-your-desk)), which is where he lives, and **the ring**, which
+floats over everything else so you can read him from across the room without
+switching windows.
+
 A small arc reactor sits in the corner of the screen. It is not a status light —
 you can watch him work:
 
@@ -170,7 +175,7 @@ Everything you need is a double-click. No terminal, ever.
 
 | Double-click | What it does |
 |---|---|
-| **JARVIS.exe** | brings him online — this is the one you want |
+| **JARVIS.exe** | brings him online in his own window, with no console — this is the one you want |
 | **Install-JARVIS.exe** | installs or repairs everything |
 | **Check-JARVIS.bat** | reports what is installed and what is missing |
 | **Test-Overlay.bat** | shows the arc reactor cycling through every state |
@@ -194,6 +199,47 @@ Everything you need is a double-click. No terminal, ever.
 To uninstall: delete the folder, then `winget uninstall Ollama.Ollama` if you want the
 model gone too. JARVIS writes nothing outside his own folder except the two shortcuts and,
 if you asked for it, the logon task (`scripts\uninstall-autostart.ps1` removes that).
+
+---
+
+## 2a. The app on your desk
+
+Double-click **JARVIS** and a window opens. Not a console, not a log: an application,
+frameless and dark, with the arc reactor in it. There is no black rectangle at any
+point — the launcher starts him through `pythonw.exe` with no console attached, and
+everything that used to scroll past in the terminal is in the window instead, laid out
+so you can read it.
+
+What is in it:
+
+| | |
+|---|---|
+| **The reactor** | large, in whatever state he is in — and it is also the button: click it to make him listen without saying "Hey Jarvis" |
+| **The working line** | what he heard → that he is thinking → each tool as it fires → the answer, with the latency from the end of your sentence to the first word of his |
+| **Cards** | the same ones as the phone: a business with its number, a timer counting down, the weather, a refusal in red |
+| **Instruments** | CPU, RAM, GPU load and temperature, VRAM, and which model is resident |
+| **Timers and reminders** | counting down, cancellable |
+| **The confirmation bar** | when a guarded tool is waiting, Confirm and Cancel appear next to the spoken window — whichever you answer first wins |
+| **A composer** | type instead of talking; same brain, same tools |
+| **A log drawer** | collapsed, for when something has gone wrong |
+
+Closing the window hides it to the tray; **right-click the tray icon → Open the console**
+brings it back. He keeps listening either way — the window is a face, not a switch.
+
+**How it is drawn.** The window is a web page rendered by Edge WebView2, which is
+already part of Windows 11. That is why it looks like the phone app: it *is* the same
+design, and a fix to a card is a fix in both. If `pywebview` could not be installed, the
+same page opens in Edge's app mode instead, which has no browser chrome either and looks
+very nearly identical. If that fails too, you are back to the floating ring alone and
+nothing else changes.
+
+| Want | Do |
+|---|---|
+| no window this once | `python -m jarvis --no-window` |
+| no window, ever | `ui.window: false` in `config.yaml` |
+| force Edge instead of the native window | `ui.window_mode: edge` |
+| no face at all | `python -m jarvis --no-ui` |
+| the old console | double-click `start-jarvis.bat` |
 
 ---
 
