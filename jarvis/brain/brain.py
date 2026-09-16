@@ -17,6 +17,7 @@ Nothing here touches audio hardware or Windows-only APIs.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -41,6 +42,56 @@ MODEL_ERROR_SENTENCE = "The language model isn't responding, sir."
 TOOL_LIMIT_SENTENCE = "I've run as many checks as I usefully can, sir, so I'll stop there."
 #: Spoken when a turn produced neither words nor a usable tool summary.
 EMPTY_TURN_SENTENCE = "I'm afraid I have nothing useful to add, sir."
+
+
+#: A local model will sometimes describe the action instead of performing it -
+#: "Opening Steam, sir" with no open_app call, or "I don't have access to real-time
+#: weather" while the weather tool sits right there in its list. The user is left
+#: looking at a screen where nothing happened, which the system prompt explicitly
+#: forbids, so the turn gets one corrective round before it is allowed to end.
+ACTION_CLAIM_PATTERNS: list[re.Pattern[str]] = [
+    # English: promising, or claiming to be in the middle of it
+    re.compile(r"\b(i'?ll|i will|let me|i'?m going to|i am going to|allow me to)\s+"
+               r"(open|launch|start|check|look|search|set|take|lock|run|play|pause|close|"
+               r"find|delete|remove|move|rename|remember|forget|type|shut)", re.I),
+    re.compile(r"\b(opening|launching|starting|checking|searching|setting|taking|locking|"
+               r"running|playing|closing|looking up)\b", re.I),
+    # Plain past tense too: "Yes, sir, I checked the weather" is the same lie.
+    re.compile(r"\b(i'?ve|i have|i just|i)\s+"
+               r"(opened|launched|started|checked|set|taken|took|locked|ran|run|searched|"
+               r"found|deleted|removed|moved|renamed)\b", re.I),
+    # Swedish
+    re.compile(r"\b(jag\s+(ska|kommer att|tänker)|låt mig)\s+"
+               r"(öppna|starta|kolla|titta|söka|ställa|ta|låsa|köra|spela|stänga|leta)", re.I),
+    re.compile(r"\b(öppnar|startar|kollar|söker|ställer in|tar|låser|kör|spelar|stänger)\b", re.I),
+    re.compile(r"\bjag har\s+(öppnat|startat|kollat|ställt|tagit|låst|kört|sökt)", re.I),
+]
+
+#: Worse than promising: denying a capability that is in the tool list.
+FALSE_INCAPACITY_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\b(don'?t|do not|cannot|can'?t|unable to)\b[^.]{0,40}"
+               r"\b(access|check|open|retrieve|fetch|see|know)\b", re.I),
+    re.compile(r"\bno access to\b", re.I),
+    re.compile(r"\b(kan inte|har inte tillgång till|saknar tillgång)\b", re.I),
+    re.compile(r"\breal[- ]time\b", re.I),
+]
+
+#: Sent for the corrective round only; never stored in the conversation.
+CORRECTION = (
+    "You just told the user what you would do, but you called no tool, so nothing "
+    "actually happened and they are looking at a screen where nothing changed. "
+    "Call the tool that performs it now. If no tool fits, say so plainly instead."
+)
+
+
+def claims_without_acting(reply: str) -> bool:
+    """True when the reply describes an action or denies a capability it has."""
+    text = str(reply or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in ACTION_CLAIM_PATTERNS) or any(
+        pattern.search(text) for pattern in FALSE_INCAPACITY_PATTERNS
+    )
 
 
 @dataclass
@@ -139,11 +190,73 @@ class Brain:
             self._emit(self._silent_turn_sentence(last_summary), on_sentence, spoken)
             self._remember(spoken, "")
 
+        # One corrective round when the model talked about acting but never acted.
+        if (
+            not cancelled
+            and not error
+            and not tool_names
+            and self._tools_payload()
+            and claims_without_acting(" ".join(spoken))
+        ):
+            self._log.warning(
+                "The model described an action without calling a tool; asking again."
+            )
+            self._correct(on_sentence, spoken, tool_names, should_stop)
+
         reply = " ".join(spoken).strip()
         log_transcript("jarvis", reply)
         if cancelled:
             self._log.info("Turn cancelled after %d character(s) of speech.", len(reply))
         return TurnResult(reply=reply, tool_calls=tool_names, cancelled=cancelled, error="")
+
+    def _correct(
+        self,
+        on_sentence: Callable[[str], None],
+        spoken: list[str],
+        tool_names: list[str],
+        should_stop: Callable[[], bool],
+    ) -> None:
+        """Give the model one more chance to actually do what it said it would.
+
+        The nudge is sent for this round only and never stored, so the conversation
+        the user sees keeps no trace of the model being told off.
+        """
+        messages = self.conversation.messages() + [{"role": "system", "content": CORRECTION}]
+        calls: list[dict] = []
+        try:
+            for delta in self.client.chat_stream(messages, self._tools_payload()):
+                if self._stopped(should_stop):
+                    return
+                if delta.kind == "tool_calls" and delta.tool_calls:
+                    calls.extend(delta.tool_calls)
+                elif delta.kind == "error":
+                    self._log.warning("The corrective round failed: %s", delta.error)
+                    return
+        except Exception as exc:  # noqa: BLE001 - a failed correction must not lose the turn
+            self._log.warning("The corrective round failed: %s", exc)
+            return
+
+        if not calls:
+            self._log.warning("The model still would not call a tool.")
+            return
+
+        self.conversation.add_assistant("", tool_calls=calls)
+        summary = self._run_tools(calls, tool_names)
+        self._set_thinking()
+
+        # Report what actually happened, so the user hears the truth rather than
+        # the promise.
+        splitter = SentenceSplitter()
+        round_text, pending, round_error, cancelled = self._stream_round(
+            splitter, on_sentence, spoken, should_stop
+        )
+        if round_error or cancelled:
+            if summary:
+                self._emit(summary, on_sentence, spoken)
+            return
+        if not round_text.strip() and summary:
+            self._emit(summary, on_sentence, spoken)
+        self._remember(spoken, round_text)
 
     def say_directly(self, text: str, on_sentence: Callable[[str], None]) -> None:
         """Speak ``text`` without involving the model, and record it as an assistant turn."""
