@@ -84,6 +84,28 @@ CORRECTION = (
 )
 
 
+#: Some model and Ollama combinations put the chain of thought in ``message.content``
+#: instead of the ``thinking`` field. JARVIS would then read a thousand words of
+#: "Okay, the user is asking..." aloud before reaching the answer. The giveaway is
+#: always the opening: reasoning starts by talking about the user in the third person
+#: or narrating a plan, which JARVIS never does.
+REASONING_OPENERS: list[re.Pattern[str]] = [
+    re.compile(r"^(okay|alright|right|so|hmm|well)\b[,.]?\s+(the user|so|i |let me|first)", re.I),
+    re.compile(r"^the user (is |just )?(asking|asked|wants|said|means)", re.I),
+    re.compile(r"^let me (check|see|think|make sure|look at|figure)", re.I),
+    re.compile(r"^first,?\s+i (should|need|have to|must)", re.I),
+    re.compile(r"^i need to (use|call|check|figure|make sure|look)", re.I),
+    re.compile(r"^(wait|but wait)[,.]", re.I),
+    re.compile(r"^i (should|will|'ll) (call|use|check) the \w+ (function|tool)", re.I),
+]
+
+
+def looks_like_reasoning(sentence: str) -> bool:
+    """True when a sentence reads like the model thinking rather than JARVIS speaking."""
+    text = str(sentence or "").strip()
+    return bool(text) and any(pattern.match(text) for pattern in REASONING_OPENERS)
+
+
 def claims_without_acting(reply: str) -> bool:
     """True when the reply describes an action or denies a capability it has."""
     text = str(reply or "").strip()
@@ -123,6 +145,8 @@ class Brain:
         self.max_tool_rounds = max(0, int(max_tool_rounds))
         self.latency = latency
         self._log: logging.Logger = logger or get_logger("brain")
+        self._leaked: list[str] = []
+        self._suppressing = False
 
     # --- public API ----------------------------------------------------------------
     def turn(
@@ -139,6 +163,8 @@ class Brain:
 
         spoken: list[str] = []
         tool_names: list[str] = []
+        self._leaked: list[str] = []      # reasoning caught before it reached the speaker
+        self._suppressing = False
         splitter = SentenceSplitter()
         last_summary = ""
         tool_rounds = 0
@@ -203,11 +229,26 @@ class Brain:
             )
             self._correct(on_sentence, spoken, tool_names, should_stop)
 
+        if self._suppressing and self._leaked and not spoken:
+            self._speak_conclusion(on_sentence, spoken)
+
         reply = " ".join(spoken).strip()
         log_transcript("jarvis", reply)
         if cancelled:
             self._log.info("Turn cancelled after %d character(s) of speech.", len(reply))
         return TurnResult(reply=reply, tool_calls=tool_names, cancelled=cancelled, error="")
+
+    def _speak_conclusion(
+        self, on_sentence: Callable[[str], None], spoken: list[str]
+    ) -> None:
+        """Say the last sentence or two of a rambling answer - the conclusion lives there."""
+        tail = [line for line in self._leaked[-2:] if not looks_like_reasoning(line)]
+        if not tail:
+            tail = self._leaked[-1:]
+        self._suppressing = False
+        self._log.info("Held back %d sentence(s) of reasoning.", len(self._leaked) - len(tail))
+        for sentence in tail:
+            self._emit(sentence, on_sentence, spoken)
 
     def _correct(
         self,
@@ -392,10 +433,27 @@ class Brain:
 
     # --- speaking -------------------------------------------------------------------
     def _emit(self, raw: str, on_sentence: Callable[[str], None], spoken: list[str]) -> None:
-        """Clean one sentence and hand it to the speaker, ignoring empties."""
+        """Clean one sentence and hand it to the speaker, ignoring empties.
+
+        If the very first sentence of a turn reads like the model thinking out loud,
+        everything is held back instead: the answer is in there somewhere, but it is
+        at the end, and nobody wants a thousand words of deliberation read to them.
+        """
         sentence = clean_for_speech(raw)
         if not sentence:
             return
+
+        if not self._suppressing and not spoken and looks_like_reasoning(sentence):
+            self._log.warning(
+                "The model is thinking out loud in its answer; holding it back and "
+                "speaking only the conclusion."
+            )
+            self._suppressing = True
+
+        if self._suppressing:
+            self._leaked.append(sentence)
+            return
+
         spoken.append(sentence)
         try:
             on_sentence(sentence)
