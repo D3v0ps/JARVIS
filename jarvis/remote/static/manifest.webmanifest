@@ -1,0 +1,13 @@
+{
+  "name": "JARVIS",
+  "short_name": "JARVIS",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#05080c",
+  "theme_color": "#29b6f6",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

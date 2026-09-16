@@ -203,6 +203,28 @@ _REFUSAL_SENTENCES: dict[str, str] = {
 }
 
 
+#: Tools that make no sense from a phone, whatever the tier says.
+#:
+#: type_text sends keystrokes into whichever window happens to be focused at the
+#: desk. From the phone you cannot see which one that is, so it is a blind action
+#: into an unknown target - the one case where "are you sure?" cannot help, because
+#: the person answering does not have the information the question needs.
+NEVER_REMOTE: frozenset[str] = frozenset({"type_text"})
+
+
+def remote_tier(spec: "ToolSpec", cfg: "Config") -> "Tier | None":
+    """The tier that applies when the request came from the phone, or None to refuse.
+
+    Whether guarded tools are allowed at all is the caller's decision - the remote
+    guard holds that flag, because it knows which device is asking. This decides the
+    rest: the ordinary tier, except for the handful of tools that are meaningless
+    without eyes on the screen. The blocklist is unchanged either way.
+    """
+    if getattr(spec, "name", "") in NEVER_REMOTE:
+        return None
+    return effective_tier(spec, cfg)
+
+
 def refusal_for(reason: str) -> str:
     """The sentence JARVIS says when he refuses.
 

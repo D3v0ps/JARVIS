@@ -173,6 +173,9 @@ class ToolSpec:
     tier: Tier
     func: Callable[[ToolContext, dict], ToolResult]
     announce: str | None = None
+    #: False means a tone is enough when this tool simply worked - which also removes
+    #: a whole model round trip from the turn. Only honoured in brief mode.
+    speak_result: bool = True
 
     def to_ollama(self) -> dict:
         """The OpenAI-style function description Ollama expects in ``tools``.

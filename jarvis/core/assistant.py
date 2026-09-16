@@ -80,9 +80,49 @@ class Assistant:
             logger=self.log,
         )
         self.state = self.parts.state
+        self.reflex = self._build_reflex()
+        self.ducker = self._build_ducker()
+        self.remote: Any = None
         self.overlay: Any = None
         self.tray: Any = None
         self._hud: Any = None
+
+    def _build_reflex(self) -> Any:
+        """The grammar that answers plain commands without waking the model."""
+        if not self.cfg.get("assistant.reflex", True):
+            return None
+        try:
+            from jarvis.brain.reflex import ReflexMatcher
+
+            matcher = ReflexMatcher(
+                self.cfg.resolve_path("prompts/sentences.yaml"),
+                language=self.cfg.get("language"),
+                logger=get_logger("brain.reflex"),
+            )
+            if matcher.available:
+                self.log.info("Reflex grammar ready: %d template(s).", matcher.templates())
+                return matcher
+            self.log.info("No reflex grammar; every utterance goes to the model.")
+        except Exception as exc:  # noqa: BLE001 - the fast path is optional, always
+            self.log.warning("Could not load the reflex grammar: %s", exc)
+        return None
+
+    def _build_ducker(self) -> Any:
+        """Quietens everything else while he is listening."""
+        if self.text_mode or not self.cfg.get("audio.ducking.enabled", True):
+            return None
+        try:
+            from jarvis.audio.ducking import Ducker
+
+            return Ducker(
+                self.state,
+                level=float(self.cfg.get("audio.ducking.level", 0.2)),
+                ramp_ms=int(self.cfg.get("audio.ducking.ramp_ms", 120)),
+                logger=get_logger("audio.ducking"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("Audio ducking unavailable: %s", exc)
+        return None
 
     # --- lifecycle --------------------------------------------------------------------
     def start(self) -> None:
@@ -101,8 +141,14 @@ class Assistant:
             self.parts.dispatcher = _HudDispatcher(self.parts.dispatcher, self._hud)
             self.parts.brain.dispatcher = self.parts.dispatcher
 
+        if self.ducker is not None:
+            # A synchronous crash-recovery pass first: a kill mid-turn must not leave
+            # Spotify at twenty percent forever.
+            self.ducker.start()
+
         self._warm_up()
         self._greet()
+        self._start_remote()
 
         if not self.text_mode:
             self._audio_thread = threading.Thread(
@@ -137,6 +183,7 @@ class Assistant:
         self._stop_turn.set()
         self._work.put(None)
         for component, method in (
+            (self.remote, "stop"), (self.ducker, "stop"),
             (self.parts.speaker, "stop"), (self.parts.speaker, "close"),
             (self.parts.player, "close"), (self.parts.mic, "stop"),
             (self.parts.scheduler, "stop"), (self.parts.client, "close"),
@@ -292,16 +339,24 @@ class Assistant:
     # --- the mind ---------------------------------------------------------------------
     def _work_loop(self) -> None:
         while self._running.is_set():
-            utterance = self._work.get()
-            if utterance is None:
+            item = self._work.get()
+            if item is None:
                 return
+            from_phone = not isinstance(item, np.ndarray)
             try:
-                self._handle_utterance(utterance)
+                if from_phone:
+                    self._handle_remote_turn(item)
+                else:
+                    self._handle_utterance(item)
             except Exception as exc:  # noqa: BLE001
                 self.log.exception("The turn failed: %s", exc)
-                self._say_in_character("Something went wrong on my end, sir.")
+                if not from_phone:
+                    self._say_in_character("Something went wrong on my end, sir.")
             finally:
-                self._to_listening()
+                # A turn that came from the phone must not leave the desk microphone
+                # armed and waiting for a follow-up nobody is going to speak.
+                if not from_phone:
+                    self._to_listening()
 
     def _handle_utterance(self, utterance: np.ndarray) -> None:
         transcript = self.parts.transcriber.transcribe(utterance, self.sample_rate)
@@ -316,6 +371,9 @@ class Assistant:
             self._hud.begin_turn(text)
             self._hud.state = AssistantState.THINKING
 
+        if self._answer_by_reflex(text):
+            return
+
         self._stop_turn.clear()
         result = self.parts.brain.turn(
             text, on_sentence=self._on_sentence, should_stop=self._stop_turn.is_set
@@ -327,6 +385,151 @@ class Assistant:
             self._hud.touch()
         self.log.info("Turn complete: %s", self.parts.latency.summary())
         self.parts.latency.end_turn()
+
+    def _answer_by_reflex(self, text: str) -> bool:
+        """Answer a plain command from the grammar, skipping the model entirely.
+
+        Nine utterances in ten are imperatives. Going through the model costs a second
+        and a half and gives it a chance to describe the action instead of taking it;
+        the grammar dispatches through the *same* dispatcher, so tiers and the
+        blocklist still hold, and a guarded tool still asks.
+        """
+        matcher = self.reflex
+        if matcher is None or self._mode is _Mode.CONFIRMING:
+            return False
+        try:
+            reflex = matcher.match(text)
+        except Exception as exc:  # noqa: BLE001 - never lose a turn to the fast path
+            self.log.warning("The reflex grammar failed on %r: %s", text, exc)
+            return False
+        if reflex is None:
+            return False
+
+        log_transcript("user", text)
+        self.log.info("Reflex: %s -> %s(%s)", reflex.template, reflex.tool, reflex.arguments)
+        if self._hud is not None:
+            self._hud.tool_started(reflex.tool)
+
+        started = time.perf_counter()
+        result = self.parts.dispatcher.execute(reflex.tool, dict(reflex.arguments))
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        if self._hud is not None:
+            self._hud.tool_finished(
+                reflex.tool, ok=bool(getattr(result, "ok", False)),
+                duration_ms=duration_ms, refused=bool(getattr(result, "refused", False)),
+            )
+
+        self._speak_reflex_result(reflex, result)
+
+        if self._hud is not None:
+            self._hud.latency_ms = self.parts.latency.marks().get("first audio")
+            self._hud.touch()
+        self.log.info("Reflex turn complete in %.0f ms: %s", duration_ms,
+                      self.parts.latency.summary() or "no model involved")
+        self.parts.latency.end_turn()
+        return True
+
+    def _speak_reflex_result(self, reflex: Any, result: Any) -> None:
+        """Say the confirmation - or, in brief mode, simply play a tone.
+
+        A tone instead of a sentence is not only faster to hear: it removes the whole
+        text-to-speech step from a turn that was already model-free.
+        """
+        ok = bool(getattr(result, "ok", False))
+        refused = bool(getattr(result, "refused", False))
+
+        if self.cfg.get("assistant.brief_mode", False) and not self.text_mode:
+            spec = None
+            try:
+                from jarvis.tools import registry
+
+                spec = registry.get(reflex.tool)
+            except Exception:  # noqa: BLE001
+                spec = None
+            if spec is not None and not getattr(spec, "speak_result", True):
+                chime = chimes.done() if ok else chimes.error_chime()
+                self.parts.speaker.play_chime(chime, CHIME_RATE)
+                log_transcript("jarvis", "(tone)")
+                return
+
+        try:
+            reply = self.reflex.reply_for(reflex, result)
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("reply_for failed: %s", exc)
+            reply = getattr(result, "summary", "") or ""
+        if reply:
+            self._say_in_character(reply)
+            log_transcript("jarvis", reply)
+        if not ok and not refused:
+            self.parts.speaker.play_chime(chimes.error_chime(), CHIME_RATE)
+
+    # --- the phone ---------------------------------------------------------------------
+    def _start_remote(self) -> None:
+        """Bring the phone server up, if it was asked for."""
+        if self.text_mode or not self.cfg.get("remote.enabled", False):
+            return
+        try:
+            from jarvis.remote import RemoteServer
+
+            self.remote = RemoteServer(self.cfg, self, get_logger("remote"))
+            if self.remote.start():
+                self.log.info("Remote access is on at %s", self.remote.url)
+            else:
+                self.remote = None
+        except Exception as exc:  # noqa: BLE001 - never let the phone stop the desk
+            self.log.warning("Remote access could not start: %s", exc)
+            self.remote = None
+
+    def submit_remote_turn(self, turn: Any) -> bool:
+        """Queue one turn that came from the phone. False means busy, try again.
+
+        It goes onto the same queue as the microphone rather than around it: there is
+        one GPU, one Whisper and one Ollama, and two turns at once would fight.
+        """
+        try:
+            self._work.put_nowait(turn)
+            return True
+        except queue.Full:
+            self.log.info("Busy with a turn already; the phone will have to wait.")
+            return False
+
+    def _handle_remote_turn(self, turn: Any) -> None:
+        """Transcribe and answer a turn that arrived from the phone."""
+        text = (getattr(turn, "text", "") or "").strip()
+        audio = getattr(turn, "audio", None)
+        if not text and audio is not None:
+            transcript = self.parts.transcriber.transcribe(audio, self.sample_rate)
+            self.parts.latency.mark("text")
+            text = (transcript.text or "").strip()
+        if not text:
+            turn.finish("", error="I couldn't make that out, sir.")
+            return
+
+        device = getattr(turn, "device", "the phone")
+        self.log.info("Remote turn from %s: %r", device, text)
+        if self._hud is not None:
+            self._hud.begin_turn(text)
+
+        spoken: list[str] = []
+
+        def on_sentence(sentence: str) -> None:
+            spoken.append(sentence)
+            turn.send(sentence)
+            if self._hud is not None:
+                self._hud.add_reply(sentence)
+            if self.cfg.get("remote.speak_locally", False):
+                self.parts.speaker.enqueue(sentence)
+
+        self._stop_turn.clear()
+        try:
+            result = self.parts.brain.turn(text, on_sentence=on_sentence,
+                                           should_stop=self._stop_turn.is_set)
+            turn.finish(" ".join(spoken).strip() or result.reply, error=result.error)
+        except Exception as exc:  # noqa: BLE001
+            self.log.exception("The remote turn failed: %s", exc)
+            turn.finish("", error="Something went wrong on my end, sir.")
+        finally:
+            self.parts.latency.end_turn()
 
     def _on_sentence(self, sentence: str) -> None:
         self.parts.speaker.enqueue(sentence)
@@ -352,12 +555,28 @@ class Assistant:
         self._mode = _Mode.CONFIRMING
         self.state.set(AssistantState.LISTENING)
 
+        # A tone every two seconds, so the window you have to answer in is audible
+        # as well as visible. Five repeats cover the ten seconds exactly.
+        waiting = threading.Event()
+
+        def pulse() -> None:
+            period = getattr(chimes, "AWAITING_PERIOD_MS", 2000) / 1000.0
+            while not waiting.wait(period):
+                try:
+                    self.parts.speaker.play_chime(chimes.awaiting(CHIME_RATE), CHIME_RATE)
+                except Exception:  # noqa: BLE001 - a missing tone is not a failure
+                    return
+
+        pulser = threading.Thread(target=pulse, name="jarvis-awaiting", daemon=True)
+        pulser.start()
+
         granted = False
         if self._confirm_ready.wait(timeout=self.confirmation_timeout):
             reply = (self._confirm_reply or "").strip()
             log_transcript("user", reply)
             granted = is_confirmation(reply) and not is_cancellation(reply)
 
+        waiting.set()
         self._mode = _Mode.WORKING
         self.state.set(AssistantState.THINKING)
         if self._hud is not None:

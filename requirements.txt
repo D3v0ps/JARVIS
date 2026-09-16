@@ -30,9 +30,16 @@ pillow>=10.0             # screenshot
 pycaw>=20240210          ; sys_platform == "win32"   # volume
 comtypes>=1.2            ; sys_platform == "win32"   # pycaw dependency
 pygetwindow>=0.0.9       ; sys_platform == "win32"   # close_app
+pywin32>=306             ; sys_platform == "win32"   # clipboard + the Windows Search index
+phonenumbers>=8.13       # reading phone numbers offline, for find_business and dialling
 
 # --- UI ---
 pystray>=0.19.5          # tray icon (tkinter ships with Python)
+
+# --- talking to him from your phone (only needed when remote.enabled is true) ---
+flask>=3.0
+flask-sock>=0.7
+waitress>=3.0
 
 # --- GPU acceleration for faster-whisper (harmless on CPU-only machines) ---
 nvidia-cublas-cu12       ; sys_platform == "win32"

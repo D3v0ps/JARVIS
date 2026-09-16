@@ -160,6 +160,8 @@ _PACKAGES: tuple[tuple[str, str, str, bool], ...] = (
     ("pystray", "pystray", "the tray icon", False),
     ("tkinter", "python3-tk / reinstall Python with tcl-tk", "the overlay", False),
     ("pyttsx3", "pyttsx3", "the fallback voice", False),
+    ("win32clipboard", "pywin32", "the clipboard and searching inside files", False),
+    ("phonenumbers", "phonenumbers", "reading phone numbers", False),
 )
 
 
@@ -398,6 +400,39 @@ def check_audio_devices() -> list[CheckResult]:
     return results
 
 
+def check_remote(cfg: Config) -> list[CheckResult]:
+    """Only interesting when the phone server was actually asked for."""
+    if not cfg.get("remote.enabled", False):
+        return []
+
+    results: list[CheckResult] = []
+    host = str(cfg.get("remote.host", "127.0.0.1") or "")
+    wildcard = host in ("", "0.0.0.0", "::", "[::]")
+    results.append(
+        CheckResult(
+            "Remote address",
+            not wildcard,
+            f"bound to {host}" if not wildcard
+            else f"{host or 'empty'} would listen on every interface",
+            "Set remote.host to the Tailscale address of this machine.",
+            essential=False,
+        )
+    )
+
+    missing = [name for name in ("flask", "flask_sock", "waitress") if not _has_module(name)]
+    results.append(
+        CheckResult(
+            "Remote server",
+            not missing,
+            "flask, flask-sock and waitress are installed" if not missing
+            else "missing: " + ", ".join(missing),
+            "pip install flask flask-sock waitress",
+            essential=False,
+        )
+    )
+    return results
+
+
 def _default_device_name(index: int) -> str:
     try:
         import sounddevice
@@ -413,6 +448,18 @@ def _default_device_name(index: int) -> str:
 def check_files(cfg: Config) -> list[CheckResult]:
     root = project_root()
     results: list[CheckResult] = []
+
+    sentences = root / "prompts" / "sentences.yaml"
+    results.append(
+        CheckResult(
+            "Spoken commands",
+            sentences.is_file(),
+            "prompts/sentences.yaml" if sentences.is_file()
+            else "missing - every command will go through the model instead",
+            "Restore prompts/sentences.yaml from the repository.",
+            essential=False,
+        )
+    )
 
     prompt = root / "prompts" / "jarvis_system.md"
     results.append(
@@ -463,6 +510,7 @@ def run_checks(cfg: Config, *, fix: bool = False) -> list[CheckResult]:
     results.extend(check_voice(cfg))
     results.extend(check_audio_devices())
     results.extend(check_files(cfg))
+    results.extend(check_remote(cfg))
 
     if fix:
         for change in apply_fixes(cfg):

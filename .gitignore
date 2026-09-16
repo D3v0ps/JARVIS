@@ -11,7 +11,11 @@ venv/
 logs/*.log
 logs/*.log.*
 memory.json
+places.json
 config.local.yaml
+logs/ducking.json
+logs/schedule.json
+logs/remote-secret.key
 
 # Downloaded model weights (hundreds of MB — fetched by scripts/fetch_models.py)
 models/*

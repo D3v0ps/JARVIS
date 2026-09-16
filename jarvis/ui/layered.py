@@ -58,6 +58,8 @@ IDM_PAUSE, IDM_QUIT, IDM_CENTRE, IDM_CLICKTHROUGH = 1001, 1002, 1003, 1004
 
 DIB_RGB_COLORS = 0
 FPS = 30.0
+#: How long the iris-open takes when the overlay first appears.
+BOOT_SECONDS = 1.2
 TRANSITION_S = 0.28
 
 
@@ -286,8 +288,11 @@ class LayeredOverlay:
 
         t = time.perf_counter() - self._started_at
         self.hud.state = self._current
+        # The ring irises open when it first appears. Hard-capped here rather than in
+        # the renderer, so a slow first frame cannot leave it half-built.
+        boot_t = t if t < BOOT_SECONDS else None
         frame = self.renderer.render(
-            self.hud, t,
+            self.hud, t, boot_t=boot_t,
             amplitude=self._amplitude, levels=self._levels, style=self._style_now(),
         )
         bits = ReactorRenderer.to_premultiplied_bgra(frame)

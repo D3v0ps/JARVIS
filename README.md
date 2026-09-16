@@ -265,7 +265,11 @@ and he answers in Swedish with the same manner.
 | `volume` / `media` | safe | pycaw and the media keys |
 | `screenshot` | safe | saved to `Pictures\Jarvis` |
 | `set_timer` / `set_reminder` / `list_timers` / `cancel_timer` | safe | spoken when due, even from idle |
-| `find_file` | safe | Desktop, Documents, Downloads |
+| `find_file` | safe | Desktop, Documents, Downloads — and *inside* your PDFs and Word files, through the Windows index |
+| `clipboard` | safe | reads what you copied, or merely selected on screen |
+| `find_business` / `recall_business` | safe | a real business's phone number, from OpenStreetMap and the web |
+| `dial_number` | **guarded** | dials on your Android over ADB, or hands an iPhone the number |
+| `end_call` | safe | hangs up |
 | `remember` / `forget` / `recall` | safe | `memory.json` |
 | `lock_pc` | safe | Win+L |
 | `type_text` | announced | types into the focused window after a one-second heads-up |
@@ -276,6 +280,12 @@ and he answers in Swedish with the same manner.
 
 **Guarded** means he says exactly what he is about to do and waits for you to say
 *confirm / yes / do it / kör*. Ten seconds of silence and it is cancelled.
+
+**Never dialled**, whatever you say: emergency numbers. A misheard word must not be
+able to summon an ambulance, so 112, 911, 999 and their relatives are refused before
+the confirmation is even asked — and the refusal tells you to call them yourself,
+because "that's beyond what I'm willing to do" is a useless thing to hear in an
+emergency.
 
 **Always refused**, whatever you say and whatever tier: formatting drives, `diskpart`,
 `bcdedit`, security and Defender registry keys, `Set-MpPreference`, turning off the

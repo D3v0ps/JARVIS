@@ -11,6 +11,8 @@ assistant:
   confirmation_timeout: 10  # seconds to say "confirm" on a guarded action
   safety_mode: normal       # normal | strict  (strict also guards type_text and close_app)
   max_tool_rounds: 4        # tool-call loops per turn before the model must answer
+  reflex: true              # answer plain commands from a grammar, without the model
+  brief_mode: false         # a tone instead of a sentence when a tool simply worked
 
 audio:
   input_device: null        # null = system default; or a name/substring, or an index
@@ -22,6 +24,10 @@ audio:
   barge_in: true            # interrupt Jarvis by speaking over him
   barge_in_speech_ms: 400   # sustained speech required to cut him off
   barge_in_grace_ms: 350    # ignore the first moments of his own voice
+  ducking:                  # quieten everything else while he is listening
+    enabled: true
+    level: 0.2              # 20 % of whatever it was
+    ramp_ms: 120
 
 wake:
   enabled: true
@@ -81,6 +87,7 @@ ui:
 
 tools:
   default_city: Stockholm
+  home_region: SE           # for reading phone numbers that omit the country code
   screenshot_dir: null      # null = Pictures\Jarvis
   powershell_timeout: 30
   search_results: 3
@@ -103,6 +110,14 @@ tools:
     task manager: taskmgr
     obs: obs64
     youtube: "https://www.youtube.com"
+
+remote:                     # talking to JARVIS from your phone
+  enabled: false            # an installer must never open a socket
+  host: 127.0.0.1           # the Tailscale address on the real machine, never 0.0.0.0
+  port: 8765
+  allow_guarded: false      # guarded tools are refused from the phone by default
+  speak_locally: false      # answer on the phone, not out of the desk speakers
+  routines: []              # named macros shown as buttons
 
 system:
   vram_gb: null             # filled in by preflight from nvidia-smi

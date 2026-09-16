@@ -449,7 +449,9 @@ class Dispatcher:
 * `web_tools.py` — `web_search(query)` (`ddgs`, top `tools.search_results`, ONE spoken
   sentence, titles+links in detail), `weather(city?)` (Open-Meteo geocoding + current +
   today's min/max, keyless, °C, m/s; default city from config).
-* `file_tools.py` — `find_file(name)` (walk Desktop/Documents/Downloads, depth-limited,
+* `file_tools.py` — `find_file(name?, contains?, modified_since?)` — `name` is no longer
+  required, and `contains` queries the Windows Search index, which has already read
+  inside PDFs and .docx. (walk Desktop/Documents/Downloads, depth-limited,
   top 5 hits, newest first), `file_ops(action, source, destination?)` GUARDED
   (move|delete|rename; delete goes to a `Jarvis Trash` folder rather than unlinking; refuses
   paths under C:\Windows or outside the user profile).

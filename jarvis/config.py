@@ -39,6 +39,8 @@ DEFAULTS: Final[dict[str, Any]] = {
         "confirmation_timeout": 10,
         "safety_mode": "normal",  # normal | strict
         "max_tool_rounds": 4,
+        "reflex": True,
+        "brief_mode": False,
     },
     "audio": {
         "input_device": None,
@@ -50,6 +52,7 @@ DEFAULTS: Final[dict[str, Any]] = {
         "barge_in": True,
         "barge_in_speech_ms": 400,
         "barge_in_grace_ms": 350,
+        "ducking": {"enabled": True, "level": 0.2, "ramp_ms": 120},
     },
     "wake": {
         "enabled": True,
@@ -110,6 +113,7 @@ DEFAULTS: Final[dict[str, Any]] = {
     },
     "tools": {
         "default_city": "Stockholm",
+        "home_region": "SE",
         "screenshot_dir": None,  # None = Pictures\\Jarvis
         "powershell_timeout": 30,
         "search_results": 3,
@@ -133,6 +137,14 @@ DEFAULTS: Final[dict[str, Any]] = {
             "obs": "obs64",
             "youtube": "https://www.youtube.com",
         },
+    },
+    "remote": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 8765,
+        "allow_guarded": False,
+        "speak_locally": False,
+        "routines": [],
     },
     "system": {
         "vram_gb": None,

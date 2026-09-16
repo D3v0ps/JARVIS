@@ -179,13 +179,15 @@ class HudRenderer:
         amplitude: float = 0.0,
         levels: Sequence[float] | None = None,
         style: StateStyle | None = None,
+        boot_t: float | None = None,
     ) -> np.ndarray:
         from PIL import Image, ImageDraw
 
         canvas = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
 
         ring = Image.fromarray(
-            self.reactor.render(model.state, t, amplitude=amplitude, levels=levels, style=style),
+            self.reactor.render(model.state, t, amplitude=amplitude, levels=levels,
+                                style=style, boot_t=boot_t),
             "RGBA",
         )
         canvas.alpha_composite(ring, (MARGIN, MARGIN))
