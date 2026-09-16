@@ -211,6 +211,17 @@ def test_escape_stops_him_from_anywhere_including_the_composer():
     assert '{ type: "stop" }' in escape
 
 
+def test_the_safe_answer_takes_the_keyboard_focus():
+    """This bar appears for the tools that delete files and shut the machine down.
+
+    A startled operator hits Enter or Space, so whatever holds the focus is what
+    they will choose by accident. It has to be Cancel.
+    """
+    body = SCRIPT.split("function showConfirm(", 1)[1].split("\nfunction ", 1)[0]
+    assert "ui.confirmNo.focus()" in body
+    assert "ui.confirmYes.focus()" not in body
+
+
 def test_the_confirmation_bar_starts_hidden_and_offers_both_answers():
     """A GUARDED tool is approved by mouse or by voice; whichever answers first wins."""
     assert re.search(r'<section id="confirm"[^>]*\bhidden\b', HTML), "the bar starts on screen"

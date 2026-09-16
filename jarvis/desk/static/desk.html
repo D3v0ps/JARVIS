@@ -1224,7 +1224,10 @@ function showConfirm(announcement, seconds) {
     ui.confirmFuse.style.transition = "width " + span + "s linear";
     ui.confirmFuse.style.width = "0%";
   });
-  ui.confirmYes.focus();
+  /* Cancel takes the focus, never Confirm. This bar appears for the tools that
+     delete files and shut the machine down, and the key a startled operator hits
+     is Enter or Space - which must land on the harmless one. */
+  ui.confirmNo.focus();
 }
 function answerConfirm(granted) {
   ui.confirmYes.disabled = true;
