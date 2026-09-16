@@ -1,0 +1,590 @@
+# JARVIS reflex grammar - the imperatives that never need the model.
+#
+# jarvis/brain/reflex.py compiles every template below into one regular expression
+# at start-up. A match dispatches the tool directly, which costs about two hundred
+# milliseconds instead of a full model turn.
+#
+#   values:  named lookup maps a slot can resolve a spoken phrase through
+#   slots:   the {placeholders} a template may contain, with type and limits
+#   tools:   per tool, the spoken confirmations and the rules that match
+#
+# A rule is a group of templates - English under `en`, Swedish under `sv` - that
+# share the same tool arguments. Inside a template `{slot}` captures a value and
+# `[word]` makes a single word optional (never the first word of a template).
+#
+# Matching is WHOLE-UTTERANCE: anything a template does not consume means no match,
+# and an utterance holding a conjunction ("and", "och") is always handed to the
+# model instead. Be specific here. A template that is too greedy silences the model
+# on a sentence it should have reasoned about, which is the expensive mistake.
+#
+# `replies` are spoken verbatim when the tool succeeded, rotated in order so the
+# fast path does not sound like a recording. `{result}` is the tool's own one
+# sentence summary; any argument name may also be used, e.g. {level}. When the tool
+# fails or is refused, its own summary is spoken instead - a canned confirmation
+# must never claim something that did not happen.
+
+version: 1
+
+values:
+  numbers: {
+    # English, zero to one hundred
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "twenty one": 21, "twenty two": 22, "twenty three": 23,
+    "twenty four": 24, "twenty five": 25, "twenty six": 26, "twenty seven": 27,
+    "twenty eight": 28, "twenty nine": 29, "thirty": 30, "thirty one": 31, "thirty two": 32,
+    "thirty three": 33, "thirty four": 34, "thirty five": 35, "thirty six": 36,
+    "thirty seven": 37, "thirty eight": 38, "thirty nine": 39, "forty": 40, "forty one": 41,
+    "forty two": 42, "forty three": 43, "forty four": 44, "forty five": 45, "forty six": 46,
+    "forty seven": 47, "forty eight": 48, "forty nine": 49, "fifty": 50, "fifty one": 51,
+    "fifty two": 52, "fifty three": 53, "fifty four": 54, "fifty five": 55, "fifty six": 56,
+    "fifty seven": 57, "fifty eight": 58, "fifty nine": 59, "sixty": 60, "sixty one": 61,
+    "sixty two": 62, "sixty three": 63, "sixty four": 64, "sixty five": 65, "sixty six": 66,
+    "sixty seven": 67, "sixty eight": 68, "sixty nine": 69, "seventy": 70, "seventy one": 71,
+    "seventy two": 72, "seventy three": 73, "seventy four": 74, "seventy five": 75,
+    "seventy six": 76, "seventy seven": 77, "seventy eight": 78, "seventy nine": 79,
+    "eighty": 80, "eighty one": 81, "eighty two": 82, "eighty three": 83, "eighty four": 84,
+    "eighty five": 85, "eighty six": 86, "eighty seven": 87, "eighty eight": 88,
+    "eighty nine": 89, "ninety": 90, "ninety one": 91, "ninety two": 92, "ninety three": 93,
+    "ninety four": 94, "ninety five": 95, "ninety six": 96, "ninety seven": 97,
+    "ninety eight": 98, "ninety nine": 99, "hundred": 100, "a hundred": 100, "one hundred": 100,
+    # Swedish, noll till hundra
+    "noll": 0, "ett": 1, "två": 2, "tre": 3, "fyra": 4, "fem": 5, "sex": 6, "sju": 7, "åtta": 8,
+    "nio": 9, "tio": 10, "elva": 11, "tolv": 12, "tretton": 13, "fjorton": 14, "femton": 15,
+    "sexton": 16, "sjutton": 17, "arton": 18, "nitton": 19, "en": 1, "tjugo": 20, "tjugoen": 21,
+    "tjugoett": 21, "tjugotvå": 22, "tjugotre": 23, "tjugofyra": 24, "tjugofem": 25,
+    "tjugosex": 26, "tjugosju": 27, "tjugoåtta": 28, "tjugonio": 29, "trettio": 30,
+    "trettioen": 31, "trettioett": 31, "trettiotvå": 32, "trettiotre": 33, "trettiofyra": 34,
+    "trettiofem": 35, "trettiosex": 36, "trettiosju": 37, "trettioåtta": 38, "trettionio": 39,
+    "fyrtio": 40, "fyrtioen": 41, "fyrtioett": 41, "fyrtiotvå": 42, "fyrtiotre": 43,
+    "fyrtiofyra": 44, "fyrtiofem": 45, "fyrtiosex": 46, "fyrtiosju": 47, "fyrtioåtta": 48,
+    "fyrtionio": 49, "femtio": 50, "femtioen": 51, "femtioett": 51, "femtiotvå": 52,
+    "femtiotre": 53, "femtiofyra": 54, "femtiofem": 55, "femtiosex": 56, "femtiosju": 57,
+    "femtioåtta": 58, "femtionio": 59, "sextio": 60, "sextioen": 61, "sextioett": 61,
+    "sextiotvå": 62, "sextiotre": 63, "sextiofyra": 64, "sextiofem": 65, "sextiosex": 66,
+    "sextiosju": 67, "sextioåtta": 68, "sextionio": 69, "sjuttio": 70, "sjuttioen": 71,
+    "sjuttioett": 71, "sjuttiotvå": 72, "sjuttiotre": 73, "sjuttiofyra": 74, "sjuttiofem": 75,
+    "sjuttiosex": 76, "sjuttiosju": 77, "sjuttioåtta": 78, "sjuttionio": 79, "åttio": 80,
+    "åttioen": 81, "åttioett": 81, "åttiotvå": 82, "åttiotre": 83, "åttiofyra": 84,
+    "åttiofem": 85, "åttiosex": 86, "åttiosju": 87, "åttioåtta": 88, "åttionio": 89,
+    "nittio": 90, "nittioen": 91, "nittioett": 91, "nittiotvå": 92, "nittiotre": 93,
+    "nittiofyra": 94, "nittiofem": 95, "nittiosex": 96, "nittiosju": 97, "nittioåtta": 98,
+    "nittionio": 99, "förtio": 40, "förtioen": 41, "förtioett": 41, "förtiotvå": 42,
+    "förtiotre": 43, "förtiofyra": 44, "förtiofem": 45, "förtiosex": 46, "förtiosju": 47,
+    "förtioåtta": 48, "förtionio": 49, "hundra": 100, "etthundra": 100, "ett hundra": 100,
+    # spoken durations, in minutes
+    "a quarter": 15, "quarter of an hour": 15, "a quarter of an hour": 15, "half an hour": 30,
+    "an hour": 60, "one hour": 60, "kvart": 15, "en kvart": 15, "halvtimme": 30,
+    "en halvtimme": 30, "halvtimma": 30, "en halvtimma": 30, "timme": 60, "en timme": 60
+  }
+
+  # Spoken name -> the key used in `tools.apps` in config.yaml. Whisper mishears
+  # short product names constantly, so the common mishearings live here too.
+  apps:
+    spotify: spotify
+    spotifi: spotify
+    spotifai: spotify
+    spotify's: spotify
+    chrome: chrome
+    google chrome: chrome
+    krom: chrome
+    edge: edge
+    microsoft edge: edge
+    firefox: firefox
+    fire fox: firefox
+    code: code
+    vs code: code
+    vscode: code
+    vs-code: code
+    visual studio code: code
+    steam: steam
+    stream: steam
+    steam up: steam
+    discord: discord
+    diskord: discord
+    explorer: explorer
+    file explorer: explorer
+    windows explorer: explorer
+    utforskaren: explorer
+    filutforskaren: explorer
+    terminal: terminal
+    windows terminal: terminal
+    terminalen: terminal
+    powershell: powershell
+    power shell: powershell
+    settings: settings
+    windows settings: settings
+    inställningar: settings
+    calculator: calculator
+    calc: calculator
+    kalkylatorn: calculator
+    miniräknaren: calculator
+    räknaren: calculator
+    notepad: notepad
+    note pad: notepad
+    anteckningar: notepad
+    task manager: task manager
+    taskmanager: task manager
+    aktivitetshanteraren: task manager
+    obs: obs
+    obs studio: obs
+    youtube: youtube
+    you tube: youtube
+
+slots:
+  # A spoken application name. Kept short and forbidden from starting with an
+  # article or a noun that means the machine itself, so "close the computer" and
+  # "stäng av ljudet" fall through to the model or to the volume rules instead of
+  # becoming close_app("the computer").
+  app:
+    type: str
+    values: apps
+    max_words: 3
+    deny_first_word: [the, a, an, my, this, that, it, all, everything, sound, music,
+                      volume, screen, computer, pc, machine, window, everything,
+                      en, ett, den, det, min, mitt, allt, ljudet, ljud, musiken,
+                      musik, volymen, skärmen, datorn, dator, fönstret]
+  level:
+    type: int
+    values: numbers
+    min: 0
+    max: 100
+  minutes:
+    type: float
+    values: numbers
+    min: 1
+    max: 600
+  hours:
+    type: float
+    values: numbers
+    min: 1
+    max: 12
+  city:
+    type: str
+    max_words: 3
+    deny_first_word: [the, a, an, my, it, en, ett, den, det, min, mitt]
+  query:
+    type: str
+    max_words: 12
+
+tools:
+
+  # --- timers ---------------------------------------------------------------
+  set_timer:
+    replies:
+      en: ["{result}", "Certainly, sir. {result}", "Done, sir. {result}"]
+      sv: ["{result}", "Naturligtvis, sir. {result}", "Klart, sir. {result}"]
+    rules:
+      - args: {minutes: "{minutes}"}
+        en:
+          - "set a timer for {minutes} minutes"
+          - "set a timer for {minutes} minute"
+          - "set a timer {minutes} minutes"
+          - "set me a timer for {minutes} minutes"
+          - "start a timer for {minutes} minutes"
+          - "timer for {minutes} minutes"
+          - "set a {minutes} minute timer"
+          - "give me a {minutes} minute timer"
+          - "wake me in {minutes} minutes"
+        sv:
+          - "sätt en timer på {minutes} minuter"
+          - "sätt en timer på {minutes} minut"
+          - "sätt timer på {minutes} minuter"
+          - "starta en timer på {minutes} minuter"
+          - "ställ en timer på {minutes} minuter"
+          - "timer på {minutes} minuter"
+          - "väck mig om {minutes} minuter"
+      - args: {minutes: {slot: hours, scale: 60}}
+        en:
+          - "set a timer for {hours} hours"
+          - "set a timer for {hours} hour"
+          - "set a {hours} hour timer"
+          - "start a timer for {hours} hours"
+        sv:
+          - "sätt en timer på {hours} timmar"
+          - "sätt en timer på {hours} timme"
+          - "starta en timer på {hours} timmar"
+      - args: {minutes: "{minutes}"}
+        en:
+          - "set a timer for {minutes}"
+          - "set a timer {minutes}"
+          - "start a timer for {minutes}"
+        sv:
+          - "sätt en timer på {minutes}"
+          - "starta en timer på {minutes}"
+
+  # --- volume ---------------------------------------------------------------
+  volume:
+    replies:
+      en: ["Volume at {level}, sir.", "There you are, sir.", "{result}"]
+      sv: ["Volymen på {level}, sir.", "Varsågod, sir.", "{result}"]
+    rules:
+      - args: {action: set, level: "{level}"}
+        en:
+          - "volume to {level}"
+          - "volume at {level}"
+          - "volume {level}"
+          - "set [the] volume to {level}"
+          - "set [the] volume at {level}"
+          - "put [the] volume at {level}"
+          - "turn [the] volume to {level}"
+          - "volume to {level} percent"
+        sv:
+          - "volym till {level}"
+          - "volymen till {level}"
+          - "volym {level}"
+          - "sätt volymen till {level}"
+          - "sätt volymen på {level}"
+          - "ställ volymen på {level}"
+          - "ställ in volymen på {level}"
+          - "volym till {level} procent"
+      - args: {action: up}
+        replies:
+          en: ["Louder it is, sir.", "Turning it up, sir.", "{result}"]
+          sv: ["Höjer, sir.", "Skruvar upp, sir.", "{result}"]
+        en:
+          - "volume up"
+          - "turn [the] volume up"
+          - "turn up [the] volume"
+          - "turn it up"
+          - "louder"
+          - "a bit louder"
+        sv:
+          - "höj volymen"
+          - "höj ljudet"
+          - "höj"
+          - "skruva upp volymen"
+          - "högre"
+          - "lite högre"
+      - args: {action: down}
+        replies:
+          en: ["Quieter, sir.", "Turning it down, sir.", "{result}"]
+          sv: ["Sänker, sir.", "Skruvar ner, sir.", "{result}"]
+        en:
+          - "volume down"
+          - "turn [the] volume down"
+          - "turn down [the] volume"
+          - "turn it down"
+          - "quieter"
+          - "a bit quieter"
+          - "lower [the] volume"
+        sv:
+          - "sänk volymen"
+          - "sänk ljudet"
+          - "sänk"
+          - "skruva ner volymen"
+          - "lägre"
+          - "lite lägre"
+      - args: {action: mute}
+        replies:
+          en: ["Muted, sir.", "Silence it is, sir.", "{result}"]
+          sv: ["Ljudet av, sir.", "Tyst, sir.", "{result}"]
+        en:
+          - "mute"
+          - "mute [the] volume"
+          - "mute [the] sound"
+          - "mute [the] audio"
+          - "sound off"
+        sv:
+          - "mute"
+          - "stäng av ljudet"
+          - "ljudet av"
+          - "tysta ljudet"
+      - args: {action: unmute}
+        replies:
+          en: ["Sound is back, sir.", "Unmuted, sir.", "{result}"]
+          sv: ["Ljudet är tillbaka, sir.", "Ljudet på igen, sir.", "{result}"]
+        en:
+          - "unmute"
+          - "unmute [the] volume"
+          - "unmute [the] sound"
+          - "sound on"
+          - "sound back on"
+        sv:
+          - "unmute"
+          - "slå på ljudet"
+          - "sätt på ljudet"
+          - "ljudet på"
+
+  # --- media keys -----------------------------------------------------------
+  media:
+    replies:
+      en: ["Of course, sir.", "Right away, sir.", "{result}"]
+      sv: ["Naturligtvis, sir.", "Genast, sir.", "{result}"]
+    rules:
+      - args: {action: play_pause}
+        en:
+          - "play"
+          - "pause"
+          - "play it"
+          - "pause it"
+          - "pause [the] music"
+          - "play [the] music"
+          - "resume [the] music"
+          - "unpause [the] music"
+        sv:
+          - "spela"
+          - "pausa"
+          - "pausa musiken"
+          - "spela musiken"
+          - "fortsätt spela"
+          - "spela upp"
+      - args: {action: next}
+        en:
+          - "next"
+          - "next track"
+          - "next song"
+          - "skip"
+          - "skip this"
+          - "skip this song"
+          - "skip the song"
+          - "play the next song"
+        sv:
+          - "nästa"
+          - "nästa låt"
+          - "nästa spår"
+          - "hoppa över"
+          - "hoppa över låten"
+          - "skippa låten"
+      - args: {action: previous}
+        en:
+          - "previous"
+          - "previous track"
+          - "previous song"
+          - "last song"
+          - "go back a song"
+          - "play the previous song"
+        sv:
+          - "föregående"
+          - "föregående låt"
+          - "förra låten"
+          - "backa en låt"
+          - "gå tillbaka en låt"
+      - args: {action: stop}
+        en:
+          - "stop the music"
+          - "stop the playback"
+          - "stop playing"
+        sv:
+          - "stoppa musiken"
+          - "sluta spela"
+          - "stäng av musiken"
+
+  # --- time and date --------------------------------------------------------
+  get_time_date:
+    replies:
+      en: ["{result}", "Of course, sir. {result}"]
+      sv: ["{result}", "Naturligtvis, sir. {result}"]
+    rules:
+      - args: {}
+        en:
+          - "what time is it"
+          - "what is the time"
+          - "what's the time"
+          - "what time is it right"
+          - "tell me the time"
+          - "give me the time"
+          - "do you have the time"
+          - "what is the date"
+          - "what's the date"
+          - "what's today's date"
+          - "what is today's date"
+          - "tell me the date"
+          - "what day is it"
+          - "which day is it"
+        sv:
+          - "vad är klockan"
+          - "hur mycket är klockan"
+          - "vad är klockan nånstans"
+          - "säg klockan"
+          - "säg vad klockan är"
+          - "vilken tid är det"
+          - "vilket datum är det"
+          - "vad är datumet"
+          - "vilken dag är det"
+          - "vilken veckodag är det"
+
+  # --- machine status -------------------------------------------------------
+  system_status:
+    replies:
+      en: ["{result}", "Of course, sir. {result}"]
+      sv: ["{result}", "Naturligtvis, sir. {result}"]
+    rules:
+      - args: {}
+        en:
+          - "system status"
+          - "status report"
+          - "give me a status report"
+          - "give me a system status"
+          - "how's the system"
+          - "how is the system"
+          - "how's the system doing"
+          - "how is the system doing"
+          - "how's the machine doing"
+          - "how's the pc doing"
+          - "how are we doing"
+        sv:
+          - "systemstatus"
+          - "statusrapport"
+          - "ge mig en statusrapport"
+          - "ge mig en systemstatus"
+          - "hur mår systemet"
+          - "hur mår datorn"
+          - "hur går det för datorn"
+          - "hur ligger vi till"
+
+  # --- lock -----------------------------------------------------------------
+  lock_pc:
+    replies:
+      en: ["Locking up, sir.", "Securing the session, sir.", "{result}"]
+      sv: ["Låser, sir.", "Säkrar sessionen, sir.", "{result}"]
+    rules:
+      - args: {}
+        en:
+          - "lock [the] pc"
+          - "lock [the] computer"
+          - "lock [the] machine"
+          - "lock [the] screen"
+          - "lock my pc"
+          - "lock my computer"
+          - "lock my screen"
+          - "lock it"
+          - "lock up"
+          - "lock it up"
+        sv:
+          - "lås datorn"
+          - "lås skärmen"
+          - "lås min dator"
+          - "lås min skärm"
+          - "lås ner datorn"
+          - "lås"
+
+  # --- screenshot -----------------------------------------------------------
+  screenshot:
+    replies:
+      en: ["{result}", "Captured, sir. {result}"]
+      sv: ["{result}", "Fångad, sir. {result}"]
+    rules:
+      - args: {}
+        en:
+          - "screenshot"
+          - "take a screenshot"
+          - "take a screen shot"
+          - "grab a screenshot"
+          - "get me a screenshot"
+          - "capture the screen"
+          - "screen grab"
+        sv:
+          - "skärmdump"
+          - "ta en skärmdump"
+          - "ta en skärmbild"
+          - "skärmbild"
+          - "fånga skärmen"
+          - "ta en bild av skärmen"
+
+  # --- weather --------------------------------------------------------------
+  weather:
+    replies:
+      en: ["{result}", "Of course, sir. {result}"]
+      sv: ["{result}", "Naturligtvis, sir. {result}"]
+    rules:
+      - args: {city: "{city}"}
+        en:
+          - "what's the weather in {city}"
+          - "what is the weather in {city}"
+          - "how's the weather in {city}"
+          - "how is the weather in {city}"
+          - "what's the weather like in {city}"
+          - "weather in {city}"
+          - "what's the forecast for {city}"
+        sv:
+          - "vad är vädret i {city}"
+          - "hur är vädret i {city}"
+          - "hur är vädret i {city} just nu"
+          - "vädret i {city}"
+          - "vad är prognosen för {city}"
+      - args: {}
+        en:
+          - "weather"
+          - "what's the weather"
+          - "what is the weather"
+          - "how's the weather"
+          - "how is the weather"
+          - "what's the weather like"
+          - "what's it like outside"
+          - "what's the forecast"
+        sv:
+          - "vädret"
+          - "vad är vädret"
+          - "hur är vädret"
+          - "hur är vädret ute"
+          - "hur ser vädret ut"
+          - "vad är prognosen"
+
+  # --- web search -----------------------------------------------------------
+  web_search:
+    replies:
+      en: ["{result}", "Here's what I found, sir. {result}"]
+      sv: ["{result}", "Så här ser det ut, sir. {result}"]
+    rules:
+      - args: {query: "{query}"}
+        en:
+          - "search for {query}"
+          - "search the web for {query}"
+          - "search {query}"
+          - "google {query}"
+          - "look up {query}"
+          - "look {query} up"
+        sv:
+          - "sök efter {query}"
+          - "sök på nätet efter {query}"
+          - "sök {query}"
+          - "googla {query}"
+          - "slå upp {query}"
+          - "leta upp {query}"
+          - "kolla upp {query}"
+
+  # --- applications ---------------------------------------------------------
+  open_app:
+    replies:
+      en: ["Right away, sir.", "Opening it now, sir.", "{result}"]
+      sv: ["Genast, sir.", "Öppnar den nu, sir.", "{result}"]
+    rules:
+      - args: {name: "{app}"}
+        en:
+          - "open {app}"
+          - "open up {app}"
+          - "launch {app}"
+          - "start {app}"
+          - "start up {app}"
+          - "fire up {app}"
+          - "bring up {app}"
+          - "pull up {app}"
+        sv:
+          - "öppna {app}"
+          - "öppna upp {app}"
+          - "starta {app}"
+          - "starta upp {app}"
+          - "kör igång {app}"
+          - "dra igång {app}"
+
+  close_app:
+    replies:
+      en: ["Closing it, sir.", "Shutting it down, sir.", "{result}"]
+      sv: ["Stänger den, sir.", "Avslutar den, sir.", "{result}"]
+    rules:
+      - args: {name: "{app}"}
+        en:
+          - "close {app}"
+          - "close down {app}"
+          - "quit {app}"
+          - "exit {app}"
+          - "shut down {app}"
+          - "kill {app}"
+        sv:
+          - "stäng {app}"
+          - "stäng ner {app}"
+          - "stäng av {app}"
+          - "avsluta {app}"
+          - "döda {app}"
