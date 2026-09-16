@@ -620,3 +620,182 @@ path, exception path), `test_ollama_client.py` (streaming parsed from a fake NDJ
 server on 127.0.0.1), `test_conversation.py` (trimming keeps tool pairs intact),
 `test_chimes.py` (shape/range/no clipping), `test_vad_energy.py`, `test_brain_turn.py`
 (fake client + fake dispatcher: sentences stream out in order, tool round-trip works).
+
+---
+
+# Part two — the features added after the first real week of use
+
+Same rules as above: exact signatures, no Windows-only imports at module load, every
+module testable on a bare Linux box, nothing over ~400 lines.
+
+## 18. `jarvis/brain/reflex.py` — the command grammar underneath the model
+
+Nine utterances in ten are imperatives: "volume to forty", "set a ten minute timer",
+"open Spotify". Each costs a full model turn today, and each is a chance for the model
+to narrate instead of act. A template match dispatches those in ~200 ms through the
+*same* dispatcher, so tiers and the blocklist still hold.
+
+```python
+@dataclass
+class Reflex:
+    tool: str                    # the registered tool name
+    arguments: dict              # already coerced to the schema's types
+    utterance: str               # what was matched
+    template: str                # which template matched, for the log
+    replies: list[str]           # canned confirmations to choose between
+
+class ReflexMatcher:
+    def __init__(self, path: str | Path = "prompts/sentences.yaml", *,
+                 language: str | None = None, logger=None) -> None
+    def match(self, text: str) -> Reflex | None
+        """Whole-utterance match only. Returns None for anything with a conjunction,
+        a question, or trailing words the template did not consume - "open Spotify and
+        tell me the weather" must fall through to the model."""
+    def reply_for(self, reflex: Reflex, result) -> str
+        """One of `replies`, varied between calls so the fast path does not sound
+        like a recording. Uses the ToolResult's summary when the template says {result}."""
+    @property
+    def available(self) -> bool
+    def templates(self) -> int
+```
+
+`prompts/sentences.yaml` holds, per tool, a list of templates in English and Swedish
+with `{named}` slots, plus `replies`. Slots may declare `type: int|float|str` and a
+`values:` map for spoken numbers and app aliases. Matching is pure Python regex built
+from the templates at load - no new dependency - and is case- and punctuation-insensitive.
+
+Wired in `core/assistant.py::_handle_utterance`, between transcription and
+`brain.turn()`, and ONLY for a fresh utterance: never in `_Mode.CONFIRMING`, never
+inside a tool round. A GUARDED tool matched by a reflex still goes through
+`Dispatcher.execute`, so it still asks. Config: `assistant.reflex: true`.
+
+## 19. `jarvis/tools/places.py` — finding a real business's number
+
+```python
+@tool("find_business", tier=SAFE)   # name, near?
+@tool("recall_business", tier=SAFE) # what was looked up before
+```
+Order: Nominatim `search?format=jsonv2&extratags=1` (extratags carries `phone`,
+`contact:phone`, `opening_hours`), then Overpass for a category near a point, then the
+existing `ddgs` search plus a `requests.get` on the business's own site with a phone
+regex. Roughly 40 % of Swedish dentists and hairdressers carry a phone tag in OSM, so
+the fallback carries most lookups - say so in the log, not out loud.
+
+Both OSM endpoints need a descriptive `User-Agent` and hard throttling: Nominatim is
+1 request/second, Overpass gives anonymous callers two slots. A module-level rate
+limiter enforces it. Never scrape hitta.se or eniro.se - better data, against terms.
+
+Numbers are normalised to E.164 with `phonenumbers` (offline), region from
+`tools.home_region` (default `SE`). Results cache to `places.json` beside `memory.json`
+so a barber is looked up once, ever.
+
+## 20. `jarvis/tools/telephony.py` — dialling, honestly
+
+```python
+@tool("dial_number", tier=GUARDED)   # number, who?
+@tool("end_call", tier=SAFE)
+def adb_available() -> bool
+def call_state() -> str              # "idle" | "ringing" | "offhook" | "unknown"
+```
+Android over ADB is the real path: `adb shell am start -a android.intent.action.CALL
+-d tel:+46...`. Some builds refuse it for the `shell` uid, so fall back to
+`ACTION_DIAL` plus `input keyevent KEYCODE_CALL`, and log which fired. `call_state()`
+reads `dumpsys telephony.registry`. No device, or an iPhone: fall back to
+`os.startfile("tel:+46...")`, which hands the number to whatever Windows has
+registered - usually Phone Link - and say plainly that the call must be started on the
+phone. Never claim a call was placed that was not.
+
+While a call is up, `Assistant` pauses: no wake word, no speaking. That is the
+etiquette, and it is enforced in the loop rather than in the prompt.
+
+**JARVIS never speaks on the call.** There is no Windows API to put audio into one,
+and the workarounds degrade the voice to 8 kHz and feed the speakers back into the
+line. He looks the number up, drafts what to say onto the HUD, dials, and goes quiet.
+
+## 21. Brief mode, ducking and the boot sweep
+
+* `tools/base.py`: `ToolSpec.speak_result: bool = True`. False means the dispatcher
+  plays an earcon and the turn ends - which removes an entire model round trip from
+  the latency budget. Config `assistant.brief_mode` turns it on globally.
+* `audio/chimes.py` gains `ack()`, `done()`, `awaiting()`, sharing the wake chime's
+  A5→E6 motif. Binary only - succeeded, refused, waiting. Never encode *which* tool ran
+  in a tone; abstract earcons are measurably the worst way to tell things apart.
+* `audio/ducking.py`:
+  ```python
+  class Ducker:
+      def __init__(self, state: StateBus, *, level: float = 0.2, ramp_ms: int = 120,
+                   store: str | Path = "logs/ducking.json", logger=None)
+      def start(self) -> None      # subscribes to the state bus
+      def stop(self) -> None       # restores, always
+      def duck(self) -> None
+      def restore(self) -> None
+      @property
+      def available(self) -> bool
+  ```
+  `pycaw` is already a dependency. Snapshot every session's `SimpleAudioVolume`, ramp
+  to `level` on LISTENING, restore on IDLE in a `finally` **and** from the persisted
+  snapshot at startup, so a crash never leaves Spotify at 20 % forever. Exclude
+  JARVIS's own PID. This is not decoration: it fixes transcription accuracy, wake
+  misses and false barge-in over music in one move.
+* `ui/reactor.py`: `render(..., boot_t: float | None = None)` animates an iris-open,
+  inner radius and coil count 0→8 over ~1.2 s. Hard-capped at three seconds, and the
+  wake-word thread starts first. No continuous hum - it is fan noise by week two.
+
+## 22. `jarvis/tools/clipboard_tools.py` and search inside files
+
+```python
+@tool("clipboard", tier=SAFE)   # action: read | summarise | translate | explain
+```
+`win32clipboard` for `CF_UNICODETEXT`, `CF_HDROP` and `CF_DIB`. For text merely
+selected on screen, synthesise Ctrl+C with the `SendInput` code already in
+`input_tools.py`, read, then restore the previous contents; detect "nothing was
+selected" by comparing `GetClipboardSequenceNumber` before and after. Wrap
+`OpenClipboard` in a short retry loop, and honour
+`ExcludeClipboardContentFromMonitorProcessing` and `CanIncludeInClipboardHistory` or a
+password manager's payload will one day end up in `logs/jarvis.log`. Truncate hard.
+
+`file_tools.find_file` gains `contains` and `modified_since` rather than a new tool.
+Query the index Windows already maintains through `pywin32`:
+`ADODB.Connection` with `Provider=Search.CollatorDSO`, `SELECT TOP 10
+System.ItemPathDisplay FROM SYSTEMINDEX WHERE CONTAINS(...) AND SCOPE='file:...'`. It
+reads inside PDFs and .docx because the index already parsed them. Keep the `fnmatch`
+walk as the fallback, and say "nothing indexed matches" rather than "that file does not
+exist" when the index is rebuilding.
+
+## 23. `jarvis/remote/` — the phone as a push-to-talk satellite
+
+```
+remote/__init__.py
+remote/server.py     RemoteServer(cfg, assistant, logger)  .start() .stop() .url
+remote/session.py    per-connection state, pairing, rate limits
+remote/static/index.html   the whole PWA: one file, no build step
+```
+Flask + flask-sock + waitress - threaded WSGI, matching this codebase's thread model.
+
+The wire format is the decisive detail: **not `MediaRecorder`** (iOS gives AAC, Android
+gives webm/opus, and the server would need a decoder). The page uses
+`@ricky0123/vad-web`, whose `onSpeechEnd` hands back a **Float32Array of 16 kHz mono** -
+byte for byte what `Transcriber.transcribe(audio, sample_rate=16000)` already takes.
+Same Silero model as the desk.
+
+A remote turn goes onto the assistant's existing `_work` queue, never around it: one
+GPU, one Whisper, one Ollama. `Brain.turn`'s `on_sentence` pushes each finished
+sentence down the socket so the phone starts speaking on sentence one, exactly like the
+desk. A second socket carries `StateBus` changes so the page shows the same states.
+
+Security, because this thing runs PowerShell:
+* `remote.enabled: false` by default. An installer must never open a socket.
+* Bind to the Tailscale interface address, never `0.0.0.0`.
+* `safety.remote_tier()`: GUARDED tools are **refused** over the phone unless
+  `remote.allow_guarded` is true - spoken confirmation is a weak control when the
+  attacker holds the microphone. The blocklist is unchanged.
+* A one-time pairing code printed to the console and shown on the ring, then a signed
+  HttpOnly cookie. Every remote turn logged with the device name.
+* A routines strip: named macros from `config.yaml`, each a sequence of existing tool
+  calls, run through the dispatcher. A fixed allowlist is the security-correct way to
+  expose real power remotely.
+
+iOS specifics that must be handled: create and `resume()` the AudioContext inside the
+push-to-talk tap handler or output is silent; offer Add to Home Screen; AudioWorklet is
+fine from iOS 14.1. Always-on wake word in the browser is not attempted - iOS suspends
+the tab and it drains the battery. Push-to-talk is the design, not a compromise.

@@ -238,22 +238,27 @@ function Select-Model {
 
     if ($Override) {
         $whisper = if ($VramGb -ge 10) { "medium" } elseif ($VramGb -ge 6) { "small" } else { "base" }
-        return @{ Model = $Override; Whisper = $whisper
+        return @{ Model = $Override; Whisper = $whisper; Embed = "qwen3-embedding:0.6b"
                   Reason = "Using the model you asked for: $Override" }
     }
     if ($VramGb -ge 15) {
-        return @{ Model = "qwen3:14b"; Whisper = "medium"
-                  Reason = "$VramGb GB of VRAM - taking qwen3:14b, the sharpest model that still leaves room for Whisper medium." }
+        # Deliberately not qwen3:14b. 14b is about 8.3 GB and Whisper medium another
+        # 2-3, which leaves no room for the embedding model that semantic memory and
+        # document search need. For a voice assistant, 8b plus a memory that grows is
+        # a better machine than 14b with none: 14b is sharper on hard questions,
+        # slower on the ninety percent that are not.
+        return @{ Model = "qwen3:8b"; Whisper = "medium"; Embed = "qwen3-embedding:0.6b"
+                  Reason = "$VramGb GB of VRAM - taking qwen3:8b with Whisper medium, leaving room for the embedding model that gives him a memory." }
     }
     if ($VramGb -ge 7) {
-        return @{ Model = "qwen3:8b"; Whisper = "small"
+        return @{ Model = "qwen3:8b"; Whisper = "small"; Embed = "qwen3-embedding:0.6b"
                   Reason = "$VramGb GB of VRAM - taking qwen3:8b with Whisper small, which keeps the whole turn under two seconds." }
     }
     if ($VramGb -ge 4) {
-        return @{ Model = "qwen3:4b"; Whisper = "base"
+        return @{ Model = "qwen3:4b"; Whisper = "base"; Embed = ""
                   Reason = "$VramGb GB of VRAM - taking the smaller qwen3:4b so it fits on the card." }
     }
-    return @{ Model = "qwen3:4b"; Whisper = "base"
+    return @{ Model = "qwen3:4b"; Whisper = "base"; Embed = ""
               Reason = "No usable GPU - taking qwen3:4b on the CPU. He will be slower, but he will work." }
 }
 
@@ -377,6 +382,7 @@ if ($vramGb -eq 0) {
 $choice = Select-Model -VramGb $vramGb -Override $Model
 $chosenModel  = $choice.Model
 $whisperModel = $choice.Whisper
+$embedModel   = $choice.Embed
 Say $choice.Reason
 
 # --------------------------------------------------------------------------- #
@@ -447,6 +453,17 @@ if ($installed -match [regex]::Escape($chosenModel)) {
         if ($code -ne 0) { Abort "Could not pull a language model." "Check your internet connection and run 'ollama pull qwen3:8b' by hand." }
     }
     Ok "$chosenModel is ready"
+}
+
+if ($embedModel) {
+    if ($installed -match [regex]::Escape($embedModel)) {
+        Ok "$embedModel is already pulled"
+    } else {
+        Say "Pulling $embedModel - the memory model, a few hundred megabytes."
+        $code = Invoke-Native "ollama" @("pull", $embedModel) -Passthrough
+        if ($code -ne 0) { Warn "Could not pull $embedModel; semantic memory will be unavailable." }
+        else { Ok "$embedModel is ready" }
+    }
 }
 
 # --------------------------------------------------------------------------- #
