@@ -125,6 +125,12 @@ class FakeWindow:
     def _probe(self, name: str) -> bool:
         return name == self._hosts
 
+    def would_host(self) -> str:
+        """The real DeskWindow's public answer to "which host would take this page",
+        which build_desk asks before anything is built. Mirrored here, through the
+        same probe, so a fake that lies about the chain cannot pass."""
+        return next((name for name in self._order() if self._probe(name)), "none")
+
     def start(self) -> bool:
         self.started += 1
         return True
@@ -462,7 +468,7 @@ def test_a_host_that_cannot_be_probed_is_not_assumed_to_want_the_main_thread(
 ):
     """An unanswerable question is a no; guessing yes would open a window nobody asked for."""
     class Silent(FakeWindow):
-        def _probe(self, name: str) -> bool:
+        def would_host(self) -> str:
             raise RuntimeError("the registry is not answering")
 
     desk_config.set("ui.window", True)

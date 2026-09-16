@@ -24,7 +24,7 @@ import platform
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -433,6 +433,41 @@ def check_remote(cfg: Config) -> list[CheckResult]:
     return results
 
 
+def check_window(cfg: Config) -> list[CheckResult]:
+    """Which host will draw the desk window, if any.
+
+    Worth its own line: the window is the first thing the operator sees, and when it
+    does not appear there is no console to explain why - that is the whole point of it.
+    """
+    if not cfg.get("ui.window", True):
+        return []
+
+    host, detail = "none", "nothing here would host it"
+    try:
+        from jarvis.desk.window import DeskWindow  # noqa: PLC0415
+
+        host = DeskWindow(cfg, "").would_host()
+    except Exception as exc:  # noqa: BLE001 - a doctor never raises
+        detail = f"could not be worked out ({type(exc).__name__})"
+    else:
+        detail = {
+            "webview": "a frameless window of its own (Edge WebView2 via pywebview)",
+            "edge": "Edge in app mode - install pywebview for the native window",
+            "browser": "your default browser - install pywebview for the native window",
+            "none": "nothing here would host it; the ring is all you get",
+        }.get(host, host)
+
+    return [
+        CheckResult(
+            "Desk window",
+            host != "none",
+            detail,
+            "pip install pywebview  (or run Install-JARVIS.exe again)",
+            essential=False,
+        )
+    ]
+
+
 def _default_device_name(index: int) -> str:
     try:
         import sounddevice
@@ -510,6 +545,7 @@ def run_checks(cfg: Config, *, fix: bool = False) -> list[CheckResult]:
     results.extend(check_voice(cfg))
     results.extend(check_audio_devices())
     results.extend(check_files(cfg))
+    results.extend(check_window(cfg))
     results.extend(check_remote(cfg))
 
     if fix:

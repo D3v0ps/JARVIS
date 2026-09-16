@@ -212,6 +212,23 @@ class DeskWindow:
             return True
         return any(self._probe(name) for name in self._order())
 
+    def would_host(self) -> str:
+        """Which host would take the page, without opening anything.
+
+        ``available()`` answers yes or no; this answers *which*, which is what the
+        preflight doctor and :func:`jarvis.core.wiring.build_desk` actually need -
+        the webview host can only ever be created on the main thread, so knowing it
+        would win has to be possible before anything is built.
+        """
+        if self.mode == "off":
+            return "none"
+        if self._backend != "none":
+            return self._backend
+        for name in self._order():
+            if self._probe(name):
+                return name
+        return "none"
+
     # --- the chain ---------------------------------------------------------------------
     def start(self) -> bool:
         """Open the window with the best host available. False, never an exception."""

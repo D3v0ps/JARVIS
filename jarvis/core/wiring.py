@@ -430,9 +430,7 @@ def _should_open_now(cfg: Config, window: Any, logger: logging.Logger) -> bool:
 def _winning_host(window: Any) -> str:
     """Which host would take the page, asked without opening anything. ``none`` if unsure."""
     try:
-        order = window._order()
-        probe = window._probe
-        return next((name for name in order if probe(name)), "none")
+        return str(window.would_host())
     except Exception:  # noqa: BLE001 - an unanswerable question is a no
         return "none"
 

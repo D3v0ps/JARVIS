@@ -48,6 +48,10 @@ CONSOLE_PROGRAMS = {
     "installer/make_icon.py",
     "scripts/enable_phone.py",
     "scripts/fetch_models.py",
+    # The operator runs this one himself from Update-JARVIS.bat, which opens a console
+    # on purpose and pauses at the end so he can read the report. pip inheriting that
+    # console is the point; hiding it would leave a long silence with nothing to read.
+    "scripts/update_jarvis.py",
 }
 
 #: ``subprocess`` entry points that start a process, and therefore a console.

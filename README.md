@@ -183,6 +183,7 @@ Everything you need is a double-click. No terminal, ever.
 | **Get-Voice.bat** | downloads the British Kokoro voice and the wake-word models |
 | **Enable-Phone.bat** | lets your phone reach him from anywhere — see [the phone](#2b-the-phone) |
 | **Disable-Phone.bat** | takes that down again |
+| **Update-JARVIS.bat** | fetches the newest version and installs it — see [keeping up to date](#2c-keeping-up-to-date) |
 
 | Command | What it does |
 |---|---|
@@ -287,6 +288,35 @@ safe to run any number of times; `Disable-Phone.bat` closes the door.
 **Without Tailscale.** On your own Wi-Fi you can set `remote.host` to the PC's LAN
 address instead, but a phone browser only opens the microphone on an HTTPS page, so
 that path is typing only. Tailscale is the one that gives you the voice.
+
+---
+
+## 2c. Keeping up to date
+
+Double-click **`Update-JARVIS.bat`**. It fetches the current source straight from
+GitHub, copies in what changed, installs anything new the requirements ask for, and
+tells you what it did. Close JARVIS first — Windows will not let anything replace a
+file that is running.
+
+What it will not do, by design:
+
+- **It never touches `config.yaml`.** Your graphics card, your model and any edits you
+  have made are in there. Every setting a new version adds has a default baked into the
+  code, so an older `config.yaml` reads perfectly well against newer code — the updater
+  just tells you which new settings exist, and leaves the file alone.
+- **It never touches** your memory, your logs, the downloaded models or the virtual
+  environment.
+- **It never deletes anything.** A file you added yourself stays where it is.
+- **Every file it replaces is copied first** into `logs\update-backup-<date>`.
+
+Want to look before you leap:
+
+```powershell
+.venv\Scripts\python scripts\update_jarvis.py --check
+```
+
+If a file cannot be replaced it says which one and stops — that means JARVIS is still
+running. Right-click the tray icon, Quit, and run it again.
 
 ---
 
