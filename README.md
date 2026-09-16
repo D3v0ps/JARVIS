@@ -281,9 +281,14 @@ never allowed from the phone.
 
 **When it does not connect.** The PC must be on and JARVIS running; sleep mode ends the
 call. Both devices must be signed in to Tailscale — the app shows a green *Connected*.
-If Enable-Phone.bat says your tailnet has HTTPS switched off, it gives you the link:
-one button in the Tailscale admin console, then run it again. `Enable-Phone.bat` is
-safe to run any number of times; `Disable-Phone.bat` closes the door.
+`Enable-Phone.bat` is safe to run any number of times; `Disable-Phone.bat` closes the door.
+
+**If Enable-Phone.bat seems to stop and wait.** The first time, your tailnet very likely
+has HTTPS certificates switched off, and Tailscale asks for permission before it will
+issue one: it prints a link in the window and then waits, quietly, for you to open it and
+press **Enable HTTPS**. Do that and the window carries on by itself. You can also enable
+it in advance at [the admin console's DNS page](https://login.tailscale.com/admin/dns) —
+scroll to **HTTPS Certificates** and turn it on.
 
 **Without Tailscale.** On your own Wi-Fi you can set `remote.host` to the PC's LAN
 address instead, but a phone browser only opens the microphone on an HTTPS page, so

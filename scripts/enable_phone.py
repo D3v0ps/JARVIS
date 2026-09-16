@@ -34,6 +34,10 @@ from jarvis.config import Config  # noqa: E402 - after the path fix
 WINGET_ID = "tailscale.tailscale"
 ADMIN_DNS = "https://login.tailscale.com/admin/dns"
 LOGIN_WAIT_S = 300
+#: `tailscale serve --https` blocks with no timeout of its own when the tailnet has not
+#: enabled HTTPS certificates: it prints an admin-console link and then watches the IPN
+#: bus until somebody clicks Enable. That is a human deciding, so the wait is generous.
+SERVE_WAIT_S = 900
 PHONE_APPS = "the Tailscale app (App Store on iPhone, Play Store on Android)"
 
 
@@ -45,6 +49,14 @@ class Shell:
 
     def run(self, argv: Sequence[str], *, timeout: float = 120, capture: bool = True) -> tuple[int, str]:
         """Run a command. Returns (exit code, combined output); never raises."""
+        if not capture:
+            # The child is about to write to the same console we are. Get our own
+            # buffered lines out first, or the instructions arrive after the thing
+            # they were meant to explain.
+            try:
+                sys.stdout.flush()
+            except Exception:  # noqa: BLE001 - no console under pythonw, and no matter
+                pass
         try:
             completed = subprocess.run(
                 list(argv), capture_output=capture, text=True, timeout=timeout,
@@ -161,12 +173,30 @@ def ensure_logged_in(shell: Shell, exe: str, *, wait_s: float = LOGIN_WAIT_S,
         sleep(2)
 
 
-def serve_on(shell: Shell, exe: str, port: int) -> tuple[bool, str]:
-    """Put Tailscale's HTTPS door in front of JARVIS. Survives reboots (``--bg``)."""
-    code, out = shell.run([exe, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"], timeout=60)
-    if code == 0:
-        return True, out
-    return False, out
+def serve_on(shell: Shell, exe: str, port: int) -> bool:
+    """Put Tailscale's HTTPS door in front of JARVIS. Survives reboots (``--bg``).
+
+    Its output goes **straight to the console**, never into a pipe. When the tailnet has
+    not enabled HTTPS certificates this command does not fail - it prints a link to the
+    admin console and then blocks, with no timeout, watching for somebody to click
+    Enable. Capturing that output hides the one thing the operator has to act on, and he
+    is left looking at a window that says nothing while Tailscale waits for him forever.
+    """
+    code, _ = shell.run(
+        [exe, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
+        timeout=SERVE_WAIT_S, capture=False,
+    )
+    # The exit code is not the question: the question is whether the door is actually
+    # open, and `serve status` is the only thing that can answer it.
+    return serve_is_up(shell, exe, port)
+
+
+def serve_is_up(shell: Shell, exe: str, port: int) -> bool:
+    """Whether Tailscale is really proxying to our port, whatever any exit code said."""
+    code, out = shell.run([exe, "serve", "status"], timeout=30)
+    if code != 0:
+        return False
+    return f"127.0.0.1:{port}" in (out or "")
 
 
 def serve_off(shell: Shell, exe: str) -> bool:
@@ -175,12 +205,6 @@ def serve_off(shell: Shell, exe: str) -> bool:
         return True
     code, _ = shell.run([exe, "serve", "reset"], timeout=60)
     return code == 0
-
-
-def needs_https_enabled(output: str) -> bool:
-    """Tailscale's way of saying the tailnet has not switched HTTPS certificates on."""
-    text = (output or "").lower()
-    return "https" in text and any(word in text for word in ("enable", "certificate", "cert", "magicdns"))
 
 
 # --- jarvis's side ----------------------------------------------------------------------
@@ -273,15 +297,21 @@ def do_on(shell: Shell, cfg: Config, *, sleep: Callable[[float], None] = time.sl
     shell.log(f"  [*] This machine on your tailnet: {state.dns_name}")
 
     port = int(cfg.get("remote.port", 8765) or 8765)
-    ok, out = serve_on(shell, exe, port)
-    if not ok and needs_https_enabled(out):
-        shell.log("  [!] Your tailnet has HTTPS certificates switched off. One click fixes it:")
-        shell.log(f"      open {ADMIN_DNS} and press 'Enable HTTPS'.")
-        shell.ask("      Press Enter here when that is done... ")
-        ok, out = serve_on(shell, exe, port)
-    if not ok:
-        shell.log(f"  [x] Tailscale would not open the door: {out}")
-        return 1
+    if serve_is_up(shell, exe, port):
+        shell.log("  [*] The HTTPS door is already open.")
+    else:
+        shell.log("  [*] Asking Tailscale for an HTTPS address...")
+        shell.log("      If a link appears below, your tailnet has HTTPS certificates")
+        shell.log("      switched off. Open it, press Enable, and leave this window be -")
+        shell.log("      it carries on by itself the moment you do.")
+        shell.log("")
+        if not serve_on(shell, exe, port):
+            shell.log("")
+            shell.log("  [x] Tailscale did not open the door.")
+            shell.log("      If it printed a link above, open it and press Enable HTTPS;")
+            shell.log(f"      otherwise open {ADMIN_DNS} and enable HTTPS there.")
+            shell.log("      Then double-click Enable-Phone.bat again.")
+            return 1
     shell.log(f"  [*] HTTPS door: {state.url}  ->  JARVIS on 127.0.0.1:{port}")
 
     configure(cfg, state.url)

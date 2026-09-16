@@ -32,15 +32,23 @@ def _base(argv0: str) -> str:
 class FakeShell(ep.Shell):
     """Answers commands from a script and remembers everything that was run."""
 
-    def __init__(self, *, installed=True, states=None, serve_out=(0, "Available within your tailnet"),
+    def __init__(self, *, installed=True, states=None, serve_opens=True, door_open=False,
                  answers=("",)):
         super().__init__(log=self.lines.append if hasattr(self, "lines") else print)
         self.lines: list[str] = []
         self.log = self.lines.append
         self.calls: list[list[str]] = []
+        self.captured: dict[str, bool] = {}
+        self.timeouts: dict[str, float] = {}
         self.installed = installed
         self.states = list(states or [RUNNING])
-        self.serve_out = serve_out
+        #: Whether `serve --bg` manages to open the door. False models the real thing
+        #: when the tailnet has HTTPS certificates switched off: the command does not
+        #: fail, it prints an admin-console link and blocks until somebody clicks it,
+        #: so what our side sees is the timeout.
+        self.serve_opens = serve_opens
+        #: Whether a door is already open, which is what `serve status` reports.
+        self.door_open = door_open
         self.answers = list(answers)
         self.serve_attempts = 0
 
@@ -57,11 +65,18 @@ class FakeShell(ep.Shell):
         argv = list(argv)
         self.calls.append(argv)
         head = _base(argv[0])
+        verb = argv[1] if len(argv) > 1 else ""
+        # `serve --bg ...` and `serve status` are different calls with different rules
+        # about capturing, so they cannot share a key.
+        key = f"{head} {verb}".strip()
+        if verb == "serve" and "status" not in argv:
+            key += " --bg"
+        self.captured[key] = capture
+        self.timeouts[key] = timeout
         if head == "winget":
             self.installed = True
             return 0, ""
         if head == "tailscale.exe":
-            verb = argv[1] if len(argv) > 1 else ""
             if verb == "status":
                 state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
                 return 0, json.dumps(state)
@@ -69,14 +84,20 @@ class FakeShell(ep.Shell):
                 return 0, ""
             if verb == "serve":
                 if "status" in argv:
-                    return 0, "https://desk.tail1234.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:8765"
+                    if not self.door_open:
+                        return 0, "No serve config"
+                    return 0, ("https://desk.tail1234.ts.net (tailnet only)\n"
+                               "|-- / proxy http://127.0.0.1:8765")
                 if "off" in argv or "reset" in argv:
+                    self.door_open = False
                     return 0, ""
                 self.serve_attempts += 1
-                out = self.serve_out
-                if isinstance(out, list):
-                    out = out.pop(0) if len(out) > 1 else out[0]
-                return out
+                if self.serve_opens:
+                    self.door_open = True
+                    return 0, ""
+                # What a blocked interactive flow looks like from out here: our own
+                # timeout fires, exactly as Shell.run reports it.
+                return 124, "tailscale.EXE took longer than 900 seconds"
         return 127, f"{head} not found"
 
 
@@ -143,25 +164,63 @@ def test_a_login_that_never_completes_is_reported_not_configured(cfg, monkeypatc
     assert any("not signed in" in line for line in shell.lines)
 
 
-def test_https_off_on_the_tailnet_gets_the_admin_link_and_one_retry(cfg):
-    refusal = (1, "Tailscale serve requires HTTPS certificates to be enabled.\n"
-                  "To enable, visit https://login.tailscale.com/admin/dns")
-    shell = FakeShell(serve_out=[refusal, (0, "ok")], answers=[""])
+def test_a_blocked_https_flow_is_explained_instead_of_being_swallowed(cfg):
+    """The failure the operator actually hit, and why it looked like nothing at all.
 
-    assert ep.do_on(shell, cfg, sleep=lambda s: None) == 0
-
-    assert shell.serve_attempts == 2
-    assert any(ep.ADMIN_DNS in line for line in shell.lines)
-    assert Config.load(cfg.path).get("remote.url") == "https://desk.tail1234.ts.net"
-
-
-def test_any_other_serve_failure_leaves_config_untouched(cfg):
-    shell = FakeShell(serve_out=(1, "some other problem"))
+    `tailscale serve --https` does not fail when the tailnet has HTTPS certificates
+    switched off. It prints a link to the admin console and then blocks, with no
+    timeout of its own, watching for somebody to click Enable. All our side ever sees
+    is its own timeout - so the message has to point at the link rather than at an
+    error nobody was given.
+    """
+    shell = FakeShell(serve_opens=False)
 
     assert ep.do_on(shell, cfg, sleep=lambda s: None) == 1
 
+    said = "\n".join(shell.lines)
+    assert "press Enable" in said
+    assert ep.ADMIN_DNS in said
+    assert "Enable-Phone.bat again" in said
+    assert Config.load(cfg.path).get("remote.enabled") is False, "no door, no promise"
+
+
+def test_the_serve_output_is_never_captured(cfg):
+    """This is the bug itself. Tailscale prints the link the operator must click; with
+    the output piped he sees an empty window while Tailscale waits for him forever."""
+    shell = FakeShell()
+
+    ep.do_on(shell, cfg, sleep=lambda s: None)
+
+    assert shell.captured["tailscale.exe serve --bg"] is False
+    assert shell.timeouts["tailscale.exe serve --bg"] >= 600, (
+        "a human has to open a browser and click something; sixty seconds is not a wait"
+    )
+
+
+def test_success_is_decided_by_serve_status_not_by_an_exit_code(cfg):
+    """A door that is not actually open must never be written into config.yaml."""
+    class Liar(FakeShell):
+        def run(self, argv, *, timeout=120, capture=True):
+            code, out = super().run(argv, timeout=timeout, capture=capture)
+            if _base(argv[0]) == "tailscale.exe" and len(argv) > 1 and argv[1] == "serve" \
+                    and "status" not in argv:
+                self.door_open = False          # it said 0 and did nothing
+                return 0, ""
+            return code, out
+
+    assert ep.do_on(Liar(), cfg, sleep=lambda s: None) == 1
     assert Config.load(cfg.path).get("remote.enabled") is False
-    assert shell.serve_attempts == 1
+
+
+def test_a_door_that_is_already_open_is_left_alone(cfg):
+    """Running it twice is the documented repair path; it must not churn the config."""
+    shell = FakeShell(door_open=True)
+
+    assert ep.do_on(shell, cfg, sleep=lambda s: None) == 0
+
+    assert shell.serve_attempts == 0
+    assert any("already open" in line for line in shell.lines)
+    assert Config.load(cfg.path).get("remote.url") == "https://desk.tail1234.ts.net"
 
 
 def test_off_closes_the_door_and_switches_remote_off(cfg):
@@ -195,17 +254,6 @@ def test_status_json_is_read_defensively():
     assert state.running is False
     assert state.dns_name == ""
     assert state.url == ""
-
-
-@pytest.mark.parametrize("text, expected", [
-    ("Tailscale serve requires HTTPS certificates to be enabled", True),
-    ("HTTPS is not enabled on this tailnet; see the admin console", True),
-    ("error: MagicDNS and HTTPS certificates must be on", True),
-    ("connection refused", False),
-    ("", False),
-])
-def test_recognising_the_https_refusal(text, expected):
-    assert ep.needs_https_enabled(text) is expected
 
 
 def test_the_qr_code_is_optional():
