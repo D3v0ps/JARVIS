@@ -414,7 +414,22 @@ def check_remote(cfg: Config) -> list[CheckResult]:
             not wildcard,
             f"bound to {host}" if not wildcard
             else f"{host or 'empty'} would listen on every interface",
-            "Set remote.host to the Tailscale address of this machine.",
+            # Not "bind the Tailscale address": Tailscale Serve terminates TLS in front
+            # of loopback, and a phone browser only opens the microphone over HTTPS.
+            "Set remote.host to 127.0.0.1 and run Enable-Phone.bat.",
+            essential=False,
+        )
+    )
+
+    # The address the operator actually types into the phone. Without it he has a server
+    # running and no idea where to point anything at it.
+    public = str(cfg.get("remote.url", "") or "").strip()
+    results.append(
+        CheckResult(
+            "Phone address",
+            bool(public),
+            public if public else "no HTTPS door yet",
+            "Double-click Enable-Phone.bat; it sets one up and prints a QR code.",
             essential=False,
         )
     )
