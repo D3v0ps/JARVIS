@@ -121,22 +121,34 @@ def test_system_message_has_no_memory_block_when_nothing_is_remembered(conversat
     assert PROMPT_HEADER not in conversation.system_message()["content"]
 
 
-def test_system_message_states_the_current_date_and_time(conversation):
-    now = datetime.now()
+def test_the_model_is_told_the_current_date_and_time(conversation):
+    conversation.add_user("what time is it")
 
-    content = conversation.system_message()["content"]
+    content = conversation.messages()[-1]["content"]
 
     match = re.search(r"It is (\w+) (\d{1,2}) (\w+) (\d{4}), (\d{2}):(\d{2})\.", content)
     assert match, content
+    now = datetime.now()
     assert int(match.group(2)) == now.day
     assert int(match.group(4)) == now.year
     assert 0 <= int(match.group(5)) <= 23
 
 
-def test_the_clock_in_the_system_message_is_rebuilt_on_every_call(conversation, monkeypatch):
-    moments = iter(
-        [datetime(2026, 9, 15, 8, 15, 0), datetime(2026, 9, 15, 23, 45, 0)]
-    )
+def test_the_clock_is_not_in_the_system_message(conversation):
+    """It used to be, and it cost a prompt cache miss at every minute boundary.
+
+    Ollama caches its evaluation of the prompt prefix. With the clock inside the
+    system message, two thousand tokens of persona and tool schemas were
+    re-evaluated on every turn that happened to cross a minute.
+    """
+    conversation.add_user("what time is it")
+
+    assert "It is" not in conversation.system_message()["content"]
+
+
+def test_the_system_message_is_byte_identical_between_turns(conversation, monkeypatch):
+    """Which is the whole point: an unchanged prefix is a cache hit."""
+    moments = iter([datetime(2026, 9, 15, 8, 15, 0), datetime(2026, 9, 15, 23, 45, 0)])
 
     class FrozenDatetime(datetime):
         @classmethod
@@ -144,13 +156,15 @@ def test_the_clock_in_the_system_message_is_rebuilt_on_every_call(conversation, 
             return next(moments)
 
     monkeypatch.setattr("jarvis.brain.conversation.datetime", FrozenDatetime)
+    conversation.add_user("first")
 
-    first = conversation.system_message()["content"]
-    second = conversation.system_message()["content"]
+    first = conversation.messages()
+    conversation.add_user("second")
+    second = conversation.messages()
 
-    assert "08:15" in first
-    assert "23:45" in second
-
+    assert first[0]["content"] == second[0]["content"]
+    assert "08:15" in first[-1]["content"]
+    assert "23:45" in second[-1]["content"]
 
 def test_a_missing_prompt_file_falls_back_to_the_builtin_persona(tmp_path, memory, log):
     conversation = Conversation(tmp_path / "gone.md", memory, logger=log.logger)

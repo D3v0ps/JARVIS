@@ -197,12 +197,18 @@ class Conversation:
         return line
 
     def system_message(self) -> dict:
-        """Build the system message fresh, so the clock inside it is always current."""
+        """Build the system message. Deliberately free of anything that changes often.
+
+        The clock used to live here, which meant the prompt prefix changed at every
+        minute boundary and Ollama threw away its cached evaluation of two thousand
+        tokens of persona and tool schemas - on every turn that happened to cross a
+        minute. It now rides on the newest user message instead, where it costs
+        nothing and is just as current.
+        """
         parts = [self._character_prompt()]
         memory_block = self._memory_block()
         if memory_block:
             parts.append(memory_block)
-        parts.append(_now_line())
         language_line = self._language_line()
         if language_line:
             parts.append(language_line)
@@ -210,9 +216,18 @@ class Conversation:
 
     # --- history ------------------------------------------------------------------
     def messages(self) -> list[dict]:
-        """Return ``[system] + trimmed history``, ready to POST to Ollama."""
+        """Return ``[system] + trimmed history``, ready to POST to Ollama.
+
+        The clock is stamped onto the last user message, so everything before it is
+        byte-identical from turn to turn and Ollama's prompt cache survives.
+        """
         self.trim()
-        return [self.system_message()] + [copy.deepcopy(item) for item in self._history]
+        history = [copy.deepcopy(item) for item in self._history]
+        for item in reversed(history):
+            if item.get("role") == "user":
+                item["content"] = f"{item.get('content', '')}\n\n({_now_line()})"
+                break
+        return [self.system_message()] + history
 
     def add_user(self, text: str) -> None:
         """Append a user turn and close the previous exchange by trimming."""
