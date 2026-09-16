@@ -357,3 +357,42 @@ def test_the_phone_still_says_call_on_a_business_card():
 
     assert '"Call " + d.phone' in html
     assert "Ring " not in html
+
+
+def test_every_file_the_phone_asks_for_has_a_route(client):
+    """The page and the manifest name their own assets; each one must be servable.
+
+    Three PNG icons shipped referenced-but-unrouted and answered 404, so Add to Home
+    Screen - step three of the instructions - produced an app with a blank square for
+    an icon. This walks the references rather than naming them, so the next asset added
+    to the page is caught the day it is added.
+    """
+    static = Path(server_module._STATIC_DIR)
+    manifest = (static / "manifest.webmanifest").read_text(encoding="utf-8")
+
+    wanted: set[str] = set()
+    for text in (phone_page(), manifest):
+        wanted.update(re.findall(r"[\"'(]/?([\w.-]+\.(?:png|svg|webmanifest|css|js|ico))", text))
+    assert wanted, "the page references no assets at all, which cannot be right"
+
+    ours = sorted(name for name in wanted if (static / name).is_file())
+    assert ours, "none of the referenced assets ship with us; the regex has stopped working"
+
+    missing = [name for name in ours if client.get("/" + name).status_code != 200]
+    assert missing == [], f"referenced by the page but not served: {missing}"
+
+
+def test_an_icon_arrives_as_a_png_and_not_as_mangled_text(client):
+    """They were read with read_text once. A PNG does not survive that."""
+    response = client.get("/icon-192.png")
+
+    assert response.status_code == 200
+    assert response.mimetype == "image/png"
+    assert response.data.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_the_page_is_served_with_one_charset_not_two(client):
+    """Flask appends its own to a textual mimetype; passing one produced a doubled header."""
+    response = client.get("/")
+
+    assert response.headers["Content-Type"].count("charset") == 1

@@ -297,7 +297,7 @@ class RemoteServer:
 
         @app.get("/")
         def index() -> Any:
-            return self._static("index.html", "text/html; charset=utf-8")
+            return self._static("index.html", "text/html")
 
         @app.get("/manifest.webmanifest")
         def manifest() -> Any:
@@ -306,6 +306,20 @@ class RemoteServer:
         @app.get("/icon.svg")
         def icon() -> Any:
             return self._static("icon.svg", "image/svg+xml")
+
+        # Add to Home Screen asks for these by name, from the page and the manifest.
+        # Without them the app on the phone gets a blank square for an icon.
+        @app.get("/apple-touch-icon.png")
+        def apple_icon() -> Any:
+            return self._static("apple-touch-icon.png", "image/png")
+
+        @app.get("/icon-192.png")
+        def icon_192() -> Any:
+            return self._static("icon-192.png", "image/png")
+
+        @app.get("/icon-512.png")
+        def icon_512() -> Any:
+            return self._static("icon-512.png", "image/png")
 
         @app.get("/api/session")
         def session_info() -> Any:
@@ -368,11 +382,16 @@ class RemoteServer:
             return jsonify({"ok": ok, "said": said}), 200 if ok else 404
 
     def _static(self, name: str, mimetype: str) -> Any:
-        """Serve one file from ``static/``. A missing file is a 500 that says so."""
+        """Serve one file from ``static/``. A missing file is a 500 that says so.
+
+        Read as bytes, always: the home-screen icons are PNGs, and a text read would
+        fail on them. Flask adds its own ``charset`` to a textual mimetype, so this
+        passes the bare type and never one that already carries a charset.
+        """
         from flask import Response  # noqa: PLC0415
 
         try:
-            body = (_STATIC_DIR / name).read_text(encoding="utf-8")
+            body = (_STATIC_DIR / name).read_bytes()
         except OSError as exc:
             self.log.error("The remote file %s is missing: %s", name, exc)
             return Response(f"{name} is missing.", status=500, mimetype="text/plain")
